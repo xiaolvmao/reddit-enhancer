@@ -47,57 +47,38 @@
 
 ---
 
-## 三、编译（本机是 Windows，无法直接产出 dylib）
+## 三、编译
 
-当前机器**没有** Theos / iOS SDK / clang，WSL 也被禁用，所以这里只能交付源码与工程，编译需在 **macOS + Theos** 环境，或用 GitHub Actions 云编译。
+### 方式 A：GitHub Actions 云编译（推荐，无需 Mac，本机 Windows 可用）
 
-### 方式 A：macOS + Theos（推荐）
+工程已配好 `.github/workflows/build.yml`，用 `waruhachi/theos-action@v2.6.5` 拉取 Theos + iOS 16.5 SDK 并产出纯 dylib。
+
+1. 在 GitHub 新建一个空仓库（例如 `reddit-enhancer`）；
+2. 把本目录 `RedditEnhancerTweak/` 里的**全部文件**（含隐藏的 `.github/` 和 `.gitattributes`）推送上去：
 
 ```bash
-# 1. 安装 Theos（rootless）
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+cd RedditEnhancerTweak
+git remote add origin https://github.com/<你的用户名>/reddit-enhancer.git
+git push -u origin HEAD:main
+```
 
-# 2. 指定 iOS SDK（任选其一）
-#    a) 用 Xcode SDK：
-$THEOS/bin/download-sdk  # 或将 Xcode 的 iPhoneOS.sdk 放到 $THEOS/sdks/
-#    b) 或用已打包 SDK 放到 $THEOS/sdks/iPhoneOS16.5.sdk
+3. 打开仓库的 **Actions** 标签页 → 选中本次提交触发的 **Build RedditEnhancer dylib**（若无则点 **Run workflow**）；
+4. 构建完成后，在该 run 页面底部 **Artifacts** 下载 `RedditEnhancer-dylib`，解压得到 `libRedditEnhancer.dylib`。
+
+> workflow 会打印 `otool -L` 结果，确认其中**不含** `libsubstrate` / `libellekit` 即为纯 dylib，可直接用于 TrollStore 注入。
+
+### 方式 B：本地 macOS + Theos
+
+```bash
+# 安装 Theos（rootless）
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+# 把 iPhoneOS16.5.sdk 放到 $THEOS/sdks/（来自 theos/sdks 仓库）
 
 cd RedditEnhancerTweak
-make clean && make package   # 得到 .deb；dylib 在 .theos/obj/debug/RedditEnhancer.dylib
+make clean && make FINALPACKAGE=1   # 产出 libRedditEnhancer.dylib
 ```
 
-产物：`RedditEnhancer.dylib`（arm64）。
-
-### 方式 B：GitHub Actions 云编译（无需 Mac）
-
-新建仓库 `.github/workflows/build.yml`：
-
-```yaml
-name: Build Tweak
-on: [workflow_dispatch]
-jobs:
-  build:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Theos
-        run: |
-          git clone --recursive https://github.com/theos/theos $HOME/theos
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-          curl -L -o /tmp/sdk.txz https://github.com/opa334/iOS-SDK/raw/master/iPhoneOS13.7.sdk.txz
-          mkdir -p $HOME/theos/sdks && tar -xf /tmp/sdk.txz -C $HOME/theos/sdks
-      - name: Build
-        run: |
-          cd RedditEnhancerTweak
-          make clean && make
-          mkdir -p artifacts
-          cp .theos/obj*/RedditEnhancer.dylib artifacts/ 2>/dev/null || \
-          cp .theos/obj/debug/RedditEnhancer.dylib artifacts/
-      - uses: actions/upload-artifact@v4
-        with:
-          name: RedditEnhancer
-          path: artifacts/
-```
+产物：`libRedditEnhancer.dylib`（arm64，无 Substrate 依赖）。
 
 ---
 
@@ -110,7 +91,7 @@ jobs:
 
 ### 方式 A：Azule（最省事）
 1. 打开 Azule → 选择 Reddit IPA；
-2. 在 "Dylibs / Tweaks" 里添加编译好的 `RedditEnhancer.dylib`；
+2. 在 "Dylibs / Tweaks" 里添加编译好的 `libRedditEnhancer.dylib`；
 3. 模式选 **TrollStore / Rootless**；
 4. 注入并导出新 IPA。
 
@@ -119,10 +100,10 @@ jobs:
 ```bash
 unzip Reddit-2026.46.0.ipa -d work
 mkdir -p work/Payload/RedditApp.app/Frameworks
-cp RedditEnhancer.dylib work/Payload/RedditApp.app/Frameworks/
+cp libRedditEnhancer.dylib work/Payload/RedditApp.app/Frameworks/
 
 optool install -c load \
-  -p @executable_path/Frameworks/RedditEnhancer.dylib \
+  -p @executable_path/Frameworks/libRedditEnhancer.dylib \
   -t work/Payload/RedditApp.app/RedditApp
 
 cd work && zip -qr ../Reddit-Enhanced.ipa Payload
@@ -140,7 +121,7 @@ cd work && zip -qr ../Reddit-Enhanced.ipa Payload
 
 - **广告还在？** 确认开关 "Remove Ads / Promoted" 已打开；新版广告由 `adPayload` 注入，需刷新信息流（下拉）才会过滤新数据。
 - **悬浮按钮不出现？** 说明 dylib 未被加载：检查注入是否成功（`otool -L RedditApp | grep RedditEnhancer`），以及是否用了 TrollStore 安装。
-- **App 崩溃？** 多半是注入路径不对或 dylib 架构/签名问题：确认 arm64、ad-hoc 签名（`ldid -S RedditEnhancer.dylib`）。
+- **App 崩溃？** 多半是注入路径不对或 dylib 架构/签名问题：确认 arm64、ad-hoc 签名（`ldid -S libRedditEnhancer.dylib`）。
 - **开关无效？** 所有开关读取 `NSUserDefaults`，改完立即对后续请求生效，已缓存的旧内容需下拉刷新。
 
 ---
