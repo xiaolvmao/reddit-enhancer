@@ -51,21 +51,18 @@
 
 ### 方式 A：GitHub Actions 云编译（推荐，无需 Mac，本机 Windows 可用）
 
-工程已配好 `.github/workflows/build.yml`，用 `waruhachi/theos-action@v2.6.5` 拉取 Theos + iOS 16.5 SDK 并产出纯 dylib。
+工程已配好 `.github/workflows/build.yml`，用 `Randomblock1/theos-action@v1` 拉取 Theos + iOS 16.5 SDK 并产出纯 dylib。该 action 在 **Linux runner（ubuntu-latest）** 上交叉编译，不消耗 macOS 额度（新账号的 macOS runner 常被限制）。本工程已在此方式下**实测编译通过**。
 
-1. 在 GitHub 新建一个空仓库（例如 `reddit-enhancer`）；
-2. 把本目录 `RedditEnhancerTweak/` 里的**全部文件**（含隐藏的 `.github/` 和 `.gitattributes`）推送上去：
+仓库已建好：`https://github.com/xiaolvmao/reddit-enhancer`
 
-```bash
-cd RedditEnhancerTweak
-git remote add origin https://github.com/<你的用户名>/reddit-enhancer.git
-git push -u origin HEAD:main
-```
+推送任意提交到 `master` 即自动触发编译；也可在 Actions 页面点 **Run workflow** 手动触发。
 
-3. 打开仓库的 **Actions** 标签页 → 选中本次提交触发的 **Build RedditEnhancer dylib**（若无则点 **Run workflow**）；
-4. 构建完成后，在该 run 页面底部 **Artifacts** 下载 `RedditEnhancer-dylib`，解压得到 `RedditEnhancer.dylib`。
+1. 打开仓库的 **Actions** 标签页 → 选中 **Build RedditEnhancer dylib**；
+2. 构建完成后，在该 run 页面底部 **Artifacts** 下载 `RedditEnhancer-dylib`，解压得到 `RedditEnhancer.dylib`。
 
-> workflow 会打印 `otool -L` 结果，确认其中**不含** `libsubstrate` / `libellekit` 即为纯 dylib，可直接用于 TrollStore 注入。
+> 已验证产物：`RedditEnhancer.dylib`（arm64，约 88 KB），LC_ID_DYLIB 为
+> `@executable_path/Frameworks/RedditEnhancer.dylib`，仅依赖系统框架，不含 libsubstrate / libellekit，
+> 可直接用于 TrollStore 注入。工程根目录也已放好本次编译好的成品。
 
 ### 方式 B：本地 macOS + Theos
 

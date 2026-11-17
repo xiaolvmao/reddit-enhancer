@@ -1,0 +1,5 @@
+.theos/
+artifacts/
+packages/
+*.dylib
+*.deb
