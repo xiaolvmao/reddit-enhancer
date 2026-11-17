@@ -2,6 +2,8 @@
 //  RedditEnhancer — TrollStore tweak for Reddit 2026.46.0
 //  Bundle ID: com.reddit.Reddit   Executable: RedditApp
 //
+//  v5 —— 去掉增强设置页里的「嵌套入口」+ 广告清理补全
+//
 //  v4 —— 修复 v3 崩溃 + 入口收敛到设置页导航栏
 //
 //  v3 崩溃根因（RedditApp-2026-11-17-210334.ips）：
@@ -30,9 +32,12 @@
 //  本版策略：
 //   1) 抽屉：只改行高 / header 高度 + 隐藏 cell，绝不改行数（崩溃点）。
 //      识别信号：类名 + accessibilityIdentifier + 文案（三重冗余）。
-//   2) 设置入口：只保留设置页导航栏上的「增强设置」，去掉角落小胶囊按钮。
+//   2) 设置入口：只保留设置页导航栏上的「增强设置」，去掉角落小胶囊按钮；
+//      并且自身界面可见时一律不再注入（v5 修掉「嵌套按钮」）。
 //   3) 新增：拦截广告 / 统计追踪请求；拦截 App Store 评分弹窗。
-//   4) 诊断页：显示所有 hook 命中计数与实时日志，便于逐步定位。
+//   4) 广告清理（v5）：AdPost / PromotedCommunityPost / ConversationAd /
+//      CommentAd 等节点直接从列表里摘除，不留占位块。
+//   5) 诊断页：显示所有 hook 命中计数与实时日志，便于逐步定位。
 //
 //  Build: Theos library.mk -> plain dylib, no Substrate dependency.
 //
@@ -110,6 +115,12 @@ static NSInteger gCntURLSession = 0, gCntJSON = 0, gCntNodes = 0;
 static NSInteger gCntAdStripped = 0, gCntDrawerTables = 0, gCntSectionsHidden = 0;
 static NSInteger gCntTrackersBlocked = 0, gCntReviewBlocked = 0, gCntViewsHidden = 0;
 static NSInteger gCntHooksInstalled = 0;
+static NSInteger gCntAdNodesRemoved = 0;
+
+// 我们自己的设置页 / 诊断页正在前台时 > 0。
+// 此时绝不能再往任何导航栏注入「增强设置」入口 —— 否则会出现
+// 「进了增强设置，右上角又有一个增强设置」的嵌套按钮。
+static NSInteger gREOwnUIVisible = 0;
 
 static void RELog(NSString *fmt, ...) {
     va_list ap;
@@ -174,11 +185,14 @@ static NSArray<NSString *> *REGamesMarkers(void) {
 }
 
 // 抽屉里「资源 / Reddit Pro / Premium」相关文案 / 标识（全部小写）
+// 注意：这里的词也会拿去匹配 cell 文案，所以只放「不可能出现在正常社区名里」的词，
+// 避免把用户订阅的社区误判成推广位。
 static NSArray<NSString *> *REResourceMarkers(void) {
     return @[@"resourcessection", @"resources", @"资源",
-             @"advertiseon", @"advertise on reddit",
-             @"trypro", @"try pro", @"tryredditpro", @"reddit pro",
-             @"premiumtitle", @"reddit premium",
+             // 广告合作 / 会员升级：都归到「资源」开关下
+             @"advertise", @"广告合作",
+             @"trypro", @"try pro", @"tryredditpro", @"reddit pro", @"protitle",
+             @"premiumtitle", @"reddit premium", @"premiumupsell",
              @"prolinks", @"earntitle", @"vaulttitle",
              @"rulestitle", @"reddit rules",
              @"privacypolicy", @"privacy policy",
@@ -539,9 +553,13 @@ static UITableViewCell *REHookCellForRow(id self, SEL _cmd, UITableView *tv, NSI
                   cls, ident.length ? ident : @"(无)", (long)indexPath.section);
     }
 
-    if (RETableIsDrawer(tv) && cell && REViewIsPromo(cell)) {
-        REMarkSectionHidden(tv, indexPath.section, @"推广 cell");
-        if (RESectionIsHidden(tv, indexPath.section)) cell.hidden = YES;
+    if (RETableIsDrawer(tv) && cell) {
+        BOOL promo = REViewIsPromo(cell);
+        if (promo) REMarkSectionHidden(tv, indexPath.section, @"推广 cell");
+        // 即使安全阀拦下了整段折叠（说明推广 cell 混在正常分区里），
+        // 这个 cell 本身也必须消失 —— 否则「偶尔出现」的那条广告就漏出来了。
+        // 复用时要还原，避免把后面正常行也藏掉。
+        cell.hidden = promo;
     }
     return cell;
 }
@@ -552,9 +570,10 @@ static void REHookWillDisplayCell(id self, SEL _cmd, UITableView *tv,
         (void *)REOriIMP(self, _cmd);
     if (orig) orig(self, _cmd, tv, cell, indexPath);
 
-    if (RETableIsDrawer(tv) && cell && REViewIsPromo(cell)) {
-        REMarkSectionHidden(tv, indexPath.section, @"cell 显示");
-        if (RESectionIsHidden(tv, indexPath.section)) cell.hidden = YES;
+    if (RETableIsDrawer(tv) && cell) {
+        BOOL promo = REViewIsPromo(cell);
+        if (promo) REMarkSectionHidden(tv, indexPath.section, @"cell 显示");
+        cell.hidden = promo;
     }
 }
 
@@ -699,6 +718,43 @@ static void REResetDrawerCache(void) {
 // ---------------------------------------------------------------------------
 // JSON 过滤（信息流广告 / 推荐 / NSFW 等，保留 v2 逻辑）
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 广告识别（JSON 层 / UI 层共用）
+// 依据 2026.46.0 二进制里的真实类型名：
+//   AdPost / AsAdPost / SearchAdPost / PromotedCommunityPost /
+//   ConversationAd / ConversationAdFeedUnit / CommentAd / …AdCell
+// ---------------------------------------------------------------------------
+static BOOL RETypeIsAd(NSString *type) {
+    if (![type isKindOfClass:[NSString class]] || type.length == 0) return NO;
+    if ([type hasPrefix:@"PROMOTED"]) return YES;
+    if ([type hasPrefix:@"ConversationAd"]) return YES;      // 评论/信息流会话广告
+    if ([type hasPrefix:@"AsConversationAd"]) return YES;
+    if ([type containsString:@"PromotedCommunity"]) return YES;
+    if ([type containsString:@"HiddenAdPostReplacement"]) return YES;
+    NSArray<NSString *> *suffixes = @[@"AdPost", @"PromotedPost", @"CommentAd",
+                                      @"AdFeedUnit", @"SponsoredPost",
+                                      @"AdCell", @"AdSlot"];
+    for (NSString *suffix in suffixes) {
+        if ([type hasSuffix:suffix]) return YES;
+    }
+    return NO;
+}
+
+// 节点自带广告标记（二进制里出现过的字段：isAd / isPromoted / isCommentAd / adPayload）
+static BOOL REDictIsAd(NSDictionary *dict) {
+    if (![dict isKindOfClass:[NSDictionary class]]) return NO;
+
+    for (NSString *key in @[@"isAd", @"isPromoted", @"isSponsored", @"isCommentAd"]) {
+        id v = dict[key];
+        if ([v respondsToSelector:@selector(boolValue)] && [v boolValue]) return YES;
+    }
+    if ([dict[@"adPayload"] isKindOfClass:[NSDictionary class]]) return YES;
+
+    id type = dict[@"__typename"];
+    if ([type isKindOfClass:[NSString class]] && RETypeIsAd(type)) return YES;
+    return NO;
+}
+
 static BOOL REIsDrawerPromoItem(id item) {
     if (![item isKindOfClass:[NSDictionary class]]) return NO;
     NSDictionary *dict = (NSDictionary *)item;
@@ -718,10 +774,29 @@ static BOOL REIsDrawerPromoItem(id item) {
 
 static void REPruneArray(NSMutableArray *array) {
     if (![array isKindOfClass:[NSMutableArray class]]) return;
+    BOOL stripAds = REBool(kREFilterPromoted, YES);
     for (NSInteger i = (NSInteger)array.count - 1; i >= 0; i--) {
-        if (REIsDrawerPromoItem(array[(NSUInteger)i])) {
+        id item = array[(NSUInteger)i];
+        if (REIsDrawerPromoItem(item)) {
             [array removeObjectAtIndex:(NSUInteger)i];
             gCntAdStripped++;
+            continue;
+        }
+        // 直接从列表里摘掉广告节点：这是最干净的做法 —— 广告根本进不到视图层，
+        // 也就不会留下「已隐藏广告」的占位块（HiddenAdPostReplacement）。
+        // 评论树里的广告不动结构，只标记隐藏（见 REFilterNode）。
+        if (stripAds && [item isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *dict = (NSDictionary *)item;
+            BOOL isComment = [dict[@"__typename"] isEqual:@"Comment"];
+            // 兼容 GraphQL 连接结构：{ cursor, node: { __typename: AdPost } }
+            id inner = dict[@"node"];
+            BOOL innerIsAd = [inner isKindOfClass:[NSDictionary class]] &&
+                             REDictIsAd((NSDictionary *)inner);
+            if (!isComment && (REDictIsAd(dict) || innerIsAd)) {
+                [array removeObjectAtIndex:(NSUInteger)i];
+                gCntAdStripped++;
+                gCntAdNodesRemoved++;
+            }
         }
     }
 }
@@ -745,10 +820,9 @@ static void REFilterNode(NSMutableDictionary *node) {
         }
     }
 
-    // 广告 / 推广帖
+    // 广告 / 推广帖 / 会话广告（ConversationAd、PromotedCommunityPost 等）
     if (REBool(kREFilterPromoted, YES)) {
-        if ([type hasSuffix:@"AdPost"] || [type hasPrefix:@"PROMOTED"] ||
-            [type isEqualToString:@"REDDIT_PROMOTED"]) {
+        if (REDictIsAd(node)) {
             node[@"isHidden"] = @YES;
             gCntAdStripped++;
         }
@@ -808,6 +882,13 @@ static void REFilterNode(NSMutableDictionary *node) {
                     REMatchesAny(lowerCell, REAnswersMarkerList())) {
                     strip = YES;
                 }
+                // 广告 cell：AdPromotedCommunityPostCell / ConversationAd* /
+                // PromotedCommunityPostCell 等都藏在这个 CellGroup 里
+                if (REBool(kREFilterPromoted, YES) &&
+                    (RETypeIsAd(cellType) || REDictIsAd(cell))) {
+                    strip = YES;
+                    gCntAdNodesRemoved++;
+                }
             }
         }
         if (REBool(kREFilterPromoted, YES) &&
@@ -852,7 +933,11 @@ static void REFilterNode(NSMutableDictionary *node) {
         if (![value isKindOfClass:[NSArray class]]) continue;
         NSString *lower = key.lowercaseString;
         if (REBool(kREFilterPromoted, YES) &&
-            ([lower hasSuffix:@"ads"] || [lower containsString:@"adposts"])) {
+            ([lower hasSuffix:@"ads"] || [lower containsString:@"adposts"] ||
+             [lower containsString:@"promotedposts"] ||
+             [lower containsString:@"conversationads"] ||
+             [lower containsString:@"adslots"] || [lower containsString:@"adunits"] ||
+             [lower containsString:@"bannerads"] || [lower containsString:@"sponsored"])) {
             node[key] = @[];
             gCntAdStripped++;
         } else if (REBool(kREFilterRecommended, NO) &&
@@ -1094,9 +1179,26 @@ static void REInstallReviewHook(void) {
 // SwiftUI 里的「Ask Answers」按钮、搜索页 Trending 标题都带 UIIdentifier 的
 // rawValue 作为 accessibilityIdentifier；在这里拦下来直接隐藏，比遍历视图树便宜。
 // ---------------------------------------------------------------------------
+// 广告相关无障碍标识（取自二进制里的 UIIdentifier rawValue，全小写）
+// 这是最后一道兜底：JSON 层没拦住的广告，至少不能显示出来。
+static NSArray<NSString *> *REAdIdentifiers(void) {
+    return @[@"redditfeedpromotedpostcell",      // 信息流推广帖
+             @"redditpostpromotede",             // 推广帖内部元素（E11/E12…）
+             @"redditpostade",                   // 广告浮层
+             @"redditpostconvoad",                // 评论区会话广告
+             @"redditpostcommentad",              // 评论里的广告内容
+             @"redditpromotedcommunitypost",      // 推广社区帖
+             @"adpromotedcommunitypostcell",      // 推广社区 cell
+             @"conversationad",                   // 会话广告通用
+             @"hiddenadpost",                     // 「已隐藏广告」占位块
+             @"redditadsamaad",                   // AMA 广告状态条
+             @"redditpromotepostentrypoint"];     // 「推广你的帖子」入口
+}
+
 static BOOL REIdentifierShouldHide(NSString *ident) {
     if (![ident isKindOfClass:[NSString class]] || ident.length == 0) return NO;
     NSString *low = ident.lowercaseString;
+    if (REBool(kREFilterPromoted, YES) && REMatchesAny(low, REAdIdentifiers())) return YES;
     if (REBool(kREHideAnswers, YES) && REMatchesAny(low, REAnswersMarkerList())) return YES;
     if (REBool(kREHideTrending, YES) &&
         ([low containsString:@"trendingtoday"] ||
@@ -1250,6 +1352,7 @@ static NSString *REDiagnosticsText(void) {
     [text appendFormat:@"JSON 解析命中: %ld\n", (long)gCntJSON];
     [text appendFormat:@"JSON 节点处理: %ld\n", (long)gCntNodes];
     [text appendFormat:@"剥离广告/推荐: %ld\n", (long)gCntAdStripped];
+    [text appendFormat:@"其中摘除广告节点: %ld\n", (long)gCntAdNodesRemoved];
     [text appendString:@"\n== 开关 ==\n"];
     for (NSDictionary *row in REAllRows()) {
         NSString *key = row[@"k"];
@@ -1284,6 +1387,76 @@ static NSString *REDiagnosticsText(void) {
 @property (nonatomic, strong) UITextView *textView;
 @end
 
+// ---------------------------------------------------------------------------
+// 「是不是我们自己的界面」——用于防止在增强设置页里再注入一个增强设置按钮
+// ---------------------------------------------------------------------------
+static BOOL REIsOwnVC(UIViewController *vc) {
+    if (!vc) return NO;
+    NSString *name = NSStringFromClass([vc class]);
+    if ([name isEqualToString:@"RESettingsViewController"] ||
+        [name isEqualToString:@"REDiagnosticsViewController"]) return YES;
+    if ([vc isKindOfClass:[UINavigationController class]]) {
+        UIViewController *top = ((UINavigationController *)vc).topViewController;
+        if (top && REIsOwnVC(top)) return YES;
+    }
+    return NO;
+}
+
+static UIWindow *REKeyWindow(void) {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *window in ((UIWindowScene *)scene).windows) {
+            if (window.isKeyWindow) return window;
+        }
+    }
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindow *first = ((UIWindowScene *)scene).windows.firstObject;
+        if (first) return first;
+    }
+    return nil;
+}
+
+// 当前最顶层的控制器是不是我们自己的（含 modal 链）
+static BOOL RETopViewControllerIsOurs(void) {
+    UIViewController *vc = REKeyWindow().rootViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    if ([vc isKindOfClass:[UINavigationController class]]) {
+        vc = ((UINavigationController *)vc).visibleViewController ?: vc;
+    } else if ([vc isKindOfClass:[UITabBarController class]]) {
+        vc = ((UITabBarController *)vc).selectedViewController ?: vc;
+    }
+    return REIsOwnVC(vc);
+}
+
+// 把我们注入的「增强设置」按钮从导航栏里摘掉（幂等，可以反复调用）
+static void REStripEntryBarItems(UINavigationItem *item) {
+    if (!item) return;
+    NSArray<UIBarButtonItem *> *right = item.rightBarButtonItems;
+    if (right.count == 0) return;
+
+    NSMutableArray<UIBarButtonItem *> *keep = [NSMutableArray arrayWithCapacity:right.count];
+    BOOL removed = NO;
+    for (UIBarButtonItem *bar in right) {
+        BOOL isOurs = [bar.accessibilityIdentifier isEqualToString:@"REEntryBarItem"] ||
+                      ([bar.title isKindOfClass:[NSString class]] &&
+                       [bar.title containsString:@"增强"]);
+        if (isOurs) { removed = YES; continue; }
+        [keep addObject:bar];
+    }
+    if (removed) item.rightBarButtonItems = keep.count ? keep : nil;
+}
+
+static void REStripEntryFromBarsOf(UIViewController *vc) {
+    if (!vc) return;
+    REStripEntryBarItems(vc.navigationItem);
+    UINavigationController *nav = vc.navigationController;
+    if (!nav) return;
+    REStripEntryBarItems(nav.navigationItem);
+    if (nav.topViewController) REStripEntryBarItems(nav.topViewController.navigationItem);
+    for (UINavigationItem *item in nav.navigationBar.items) REStripEntryBarItems(item);
+}
+
 @implementation REDiagnosticsViewController
 
 - (void)viewDidLoad {
@@ -1315,6 +1488,17 @@ static NSString *REDiagnosticsText(void) {
                                         action:@selector(refresh)];
 }
 
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    gREOwnUIVisible++;
+    REStripEntryFromBarsOf(self);
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    if (gREOwnUIVisible > 0) gREOwnUIVisible--;
+}
+
 - (void)refresh {
     REWriteDrawerCollapseKeys();
     REDiscoverDrawerTables();
@@ -1337,6 +1521,18 @@ static NSString *REDiagnosticsText(void) {
                                          style:UIBarButtonItemStyleDone
                                         target:self
                                         action:@selector(re_done)];
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    gREOwnUIVisible++;
+    // 双保险：万一有别的 hook 路径把「增强设置」按钮塞进来了，进页面后立刻摘掉
+    REStripEntryFromBarsOf(self);
+}
+
+- (void)viewDidDisappear:(BOOL)animated {
+    [super viewDidDisappear:animated];
+    if (gREOwnUIVisible > 0) gREOwnUIVisible--;
 }
 
 - (void)re_done {
@@ -1493,7 +1689,10 @@ static char kREEntryRetryKey;
 static BOOL REIsExcludedSettingsLike(NSString *hay) {
     NSArray *blocked = @[@"modtools", @"notification", @"translation",
                          @"gender", @"language", @"posttype", @"room",
-                         @"chat", @"redditenhancer", @"diagnostic"];
+                         @"chat", @"redditenhancer", @"diagnostic",
+                         // 我们自己的二级菜单（标题就叫「增强设置」，
+                         // 含有「设置」两个字，必须显式排除）
+                         @"增强", @"diagnostics"];
     for (NSString *word in blocked) {
         if ([hay containsString:word]) return YES;
     }
@@ -1560,10 +1759,15 @@ static void REScheduleEntryRetry(UIViewController *vc) {
 }
 
 static void REInjectEntryIntoPage(UIViewController *vc) {
+    // 绝不在我们自己的设置页/诊断页上再注入入口（否则进增强设置后右上角
+    // 又出现一个「增强设置」，看起来像嵌套）
+    if (!vc || REIsOwnVC(vc)) return;
+    if (gREOwnUIVisible > 0 || RETopViewControllerIsOurs()) return;
+
     UINavigationController *nav = REFindNavigationController(vc);
     if (nav) {
         UIViewController *target = nav.topViewController ?: vc;
-        if (!target) return;
+        if (!target || REIsOwnVC(target)) return;
         if (REBarItemExists(target.navigationItem.rightBarButtonItems)) return;
         NSArray *right = target.navigationItem.rightBarButtonItems ?: @[];
         target.navigationItem.rightBarButtonItems =
@@ -1576,6 +1780,10 @@ static void REInjectEntryIntoPage(UIViewController *vc) {
     UINavigationBar *bar = REFindNavigationBar(vc.view, 0);
     UINavigationItem *item = bar.topItem;
     if (item) {
+        // SwiftUI 导航栏的 topItem 有可能属于我们自己的页面，靠标题兜一层
+        if ([item.title isKindOfClass:[NSString class]] &&
+            ([item.title containsString:@"增强设置"] ||
+             [item.title containsString:@"诊断信息"])) return;
         if (REBarItemExists(item.rightBarButtonItems)) return;
         NSArray *right = item.rightBarButtonItems ?: @[];
         item.rightBarButtonItems = [right arrayByAddingObject:REMakeEntryBarItem()];
@@ -1592,8 +1800,8 @@ static void REHookedViewDidAppear(id self, SEL _cmd, BOOL animated) {
 
     if (![self isKindOfClass:[UIViewController class]]) return;
     UIViewController *vc = (UIViewController *)self;
-    if ([vc isKindOfClass:[RESettingsViewController class]]) return;
-    if ([vc isKindOfClass:[REDiagnosticsViewController class]]) return;
+    // 自己的设置页 / 诊断页 / 承载它们的导航控制器：一律不处理
+    if (REIsOwnVC(vc)) return;
 
     NSString *cls = NSStringFromClass([vc class]);
 
@@ -1648,6 +1856,6 @@ __attribute__((constructor)) static void REInitialize(void) {
         REWriteDrawerCollapseKeys();
         REDiscoverDrawerTables();
 
-        RELog(@"RedditEnhancer v4.2 已加载（hook %ld 个）", (long)gCntHooksInstalled);
+        RELog(@"RedditEnhancer v5 已加载（hook %ld 个）", (long)gCntHooksInstalled);
     }
 }
