@@ -31,7 +31,9 @@
 进入 App 的**设置页**（Settings）→ 导航栏右上角出现 **「增强设置」** → 点开即为原生开关二级菜单，**全中文、全部即时生效**，无需重启 App。
 
 **内容过滤**
-1. **去除广告与推广**（默认开）— 过滤推广帖、`AdPost`、`CellGroup.adPayload`、广告容器
+1. **去除广告与推广**（默认开）— 过滤推广帖、`AdPost`、`CellGroup.adPayload`、广告容器；
+   v5 起额外覆盖 `PromotedCommunityPost`、`ConversationAd`/`CommentAd`（评论区内嵌广告）、
+   `isAd`/`isPromoted` 标记节点，并把广告节点**直接从列表里摘除**（不再是只打个隐藏标记）
 2. **隐藏推荐内容** — 过滤推荐/相似帖子注入
 3. **屏蔽 NSFW 内容** — 屏蔽 NSFW 帖
 4. **隐藏赞赏徽章** — 隐藏帖子/评论的 Awards 徽章
@@ -60,7 +62,9 @@
 >   `NSInternalInconsistencyException（Invalid update）` 直接 abort（崩溃日志已证实）。
 > - v4 改为**只动高度**：把该分区的 `heightForRow` / `heightForHeader` 归零 + 隐藏 cell，
 >   再用 `beginUpdates/endUpdates` 触发高度重算。**不碰行数、不 reloadData**，因此不可能触发该崩溃。
->   识别信号三重冗余：cell/header 类名 + `accessibilityIdentifier` + 视图树文案。
+>   识别信号四重冗余：cell/header 类名 + `accessibilityIdentifier` + 视图树文案 +
+>   子视图 `accessibilityLabel`（SwiftUI 自绘行没有 UILabel，文字只在 a11y 标签上，v5 补上）。
+>   v5 还改成：**推广 cell 自身无条件隐藏**，即使安全阀拦下了整段折叠也不会漏出那一条。
 >
 > **趋势 / Answers 是怎么去掉的（v4.2）**：这两块是 SwiftUI 页面，没有可 hook 的 UIKit 类，
 > 但 Reddit 会把 `UIIdentifier` 枚举的 rawValue 写进 `accessibilityIdentifier`。所以走两条路：
@@ -80,6 +84,13 @@
 > 检测到设置页时在**导航栏**注入「增强设置」。v4 移除了 v3 那个角落小胶囊按钮：
 > 先找 `UINavigationController`，没有就退到 SwiftUI 自己的 `UINavigationBar`（`SwiftUI.UIKitNavigationBar`），
 > 找不到就延迟重试 3 次（SwiftUI 导航栏是渲染后才生成的）。**不再有任何悬浮/角落按钮。**
+>
+> **v5 修掉「嵌套按钮」**：进增强设置后右上角又冒出一个「增强设置」，是因为注入逻辑
+> 只看类名/标题里有没有 “settings/设置”——而我们自己的二级菜单标题就叫「增强设置」。
+> 现在四道闸：① `REIsOwnVC()` 认自己的 VC（含包裹它的导航控制器）；
+> ② 全局 `gREOwnUIVisible` 计数，自身界面在前台时一律不注入；
+> ③ `RETopViewControllerIsOurs()` 看 key window 的 modal 链顶层；
+> ④ 进页面时主动把导航栏里带「增强」字样的按钮摘掉（幂等兜底）。
 >
 > **诊断页**：增强设置 → 其他 → 诊断信息。会显示 hook 安装数、抽屉表格接管数、被折叠的分区数、
 > 拦截的追踪请求数、网络命中次数、全部开关状态与实时日志；日志里还会**留档抽屉里出现过的每个
