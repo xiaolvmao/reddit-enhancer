@@ -1,0 +1,9 @@
+Package: com.redditenhancer.tweak
+Name: Reddit Enhancer
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Ad-free and optimized Reddit 2026.46.0 (TrollStore). Floating entry with native switches.
+Maintainer: RedditEnhancer
+Author: RedditEnhancer
+Section: Tweaks
+Depends:

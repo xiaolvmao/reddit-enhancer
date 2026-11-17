@@ -1,0 +1,43 @@
+name: Build RedditEnhancer dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Theos + iOS SDK
+        uses: waruhachi/theos-action@v2.6.5
+
+      - name: Build dylib
+        working-directory: ./RedditEnhancerTweak
+        run: make clean && make FINALPACKAGE=1
+
+      - name: Collect artifact
+        run: |
+          mkdir -p artifacts
+          DYLIB=$(find RedditEnhancerTweak/.theos -name 'libRedditEnhancer.dylib' -print -quit)
+          if [ -z "$DYLIB" ]; then
+            echo "::error::libRedditEnhancer.dylib not found"
+            find RedditEnhancerTweak/.theos -type f -print
+            exit 1
+          fi
+          cp "$DYLIB" artifacts/
+          echo "--- dylib info ---"
+          file "artifacts/libRedditEnhancer.dylib"
+          lipo -info "artifacts/libRedditEnhancer.dylib"
+          echo "--- linked libraries (must NOT contain substrate/ellekit) ---"
+          otool -L "artifacts/libRedditEnhancer.dylib"
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: RedditEnhancer-dylib
+          path: artifacts/
+          if-no-files-found: error
