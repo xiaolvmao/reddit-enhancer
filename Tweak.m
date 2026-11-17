@@ -1232,7 +1232,12 @@ static void RESuppressRateLimitToast(UIView *label, NSString *text) {
     for (int i = 0; i < 8 && view; i++) {
         UIView *parent = view.superview;
         if (!parent) break;
+        // 直接挂在窗口上的浮层（最常见）
         if ([parent isKindOfClass:[UIWindow class]]) { toast = view; break; }
+        // 或者祖先里明确是提示条容器（Reddit 自己的 toast / snackbar / hud）
+        NSString *cls = NSStringFromClass([parent class]).lowercaseString;
+        if ([cls containsString:@"toast"] || [cls containsString:@"snackbar"] ||
+            [cls containsString:@"hud"]) { toast = parent; break; }
         view = parent;
     }
     if (!toast) return;
