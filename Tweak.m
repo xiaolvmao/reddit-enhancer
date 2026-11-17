@@ -1986,9 +1986,16 @@ static BOOL REIdentifierShouldHide(NSString *ident) {
         ([low containsString:@"trendingtoday"] ||
          [low containsString:@"screentrendingtopics"] ||
          [low containsString:@"drawertrendstitle"])) return YES;
-    // 抽屉入口按钮（redditCommunityDrawerBarButton）兜底：视图层直接藏
-    if (REBool(kREHideDrawerAll, YES) &&
-        ([low containsString:@"drawerbar"] || [low containsString:@"drawerbutton"])) return YES;
+    return NO;
+}
+
+// 这个视图是不是挂在导航栏里（只有导航栏里的头像才算抽屉入口，
+// 资料页正文里的头像不能碰）
+static BOOL REViewIsInsideNavigationBar(UIView *view) {
+    UIView *cur = view;
+    for (int i = 0; cur && i < 10; i++, cur = cur.superview) {
+        if ([cur isKindOfClass:[UINavigationBar class]]) return YES;
+    }
     return NO;
 }
 
@@ -1996,10 +2003,29 @@ static void REHookSetA11yIdentifier(id self, SEL _cmd, NSString *ident) {
     void (*orig)(id, SEL, NSString *) = (void *)REOriIMP(self, _cmd);
     if (orig) orig(self, _cmd, ident);
 
-    if (![self isKindOfClass:[UIView class]] || !REIdentifierShouldHide(ident)) return;
+    if (![self isKindOfClass:[UIView class]]) return;
+
+    if (REIdentifierShouldHide(ident)) {
+        ((UIView *)self).hidden = YES;
+        gCntViewsHidden++;
+        RELogOnce([@"a11y|" stringByAppendingString:ident], @"按标识隐藏元素：%@", ident);
+        return;
+    }
+
+    // 抽屉入口按钮兜底（v7.2）：标识 100% 是抽屉按钮就藏；
+    // 只带 avatar 的必须是导航栏内部的，避免误伤资料页头像。
+    if (!REBool(kREHideDrawerAll, YES)) return;
+    if (![ident isKindOfClass:NSString.class] || ident.length == 0) return;
+    NSString *low = ident.lowercaseString;
+    BOOL isBarButton = [low containsString:@"drawerbar"] || [low containsString:@"drawerbutton"];
+    BOOL isNavAvatar = [low containsString:@"avatar"] &&
+                       REViewIsInsideNavigationBar((UIView *)self);
+    if (!isBarButton && !isNavAvatar) return;
+
     ((UIView *)self).hidden = YES;
-    gCntViewsHidden++;
-    RELogOnce([@"a11y|" stringByAppendingString:ident], @"按标识隐藏元素：%@", ident);
+    gCntDrawerButtonsRemoved++;
+    RELogOnce([@"a11y|drawerbtn|" stringByAppendingString:ident],
+              @"按标识隐藏抽屉入口：%@", ident);
 }
 
 static void REInstallA11yHook(void) {
