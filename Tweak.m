@@ -707,11 +707,10 @@ static char kREBlockedRowsKey;
 static char kREKeptSectionsKey;
 static char kREDrawerSigKey;
 
-static NSString *RERowKeyFor(NSIndexPath *ip) {
-    return [NSString stringWithFormat:@"%ld.%ld", (long)ip.section, (long)ip.row];
-}
-
-static NSMutableDictionary<NSString *, NSString *> *REBlockedRows(UITableView *tv, BOOL create) {
+// 被删的行：section -> 行号集合。用 NSNumber 做键（小整数是 tagged pointer，
+// 不额外分配）；行高查询每帧都会走这里，尽量别在热路径上建字符串。
+static NSMutableDictionary<NSNumber *, NSMutableIndexSet *> *
+REBlockedRowsMap(UITableView *tv, BOOL create) {
     if (!tv) return nil;
     NSMutableDictionary *m = objc_getAssociatedObject(tv, &kREBlockedRowsKey);
     if (!m && create) {
@@ -720,6 +719,18 @@ static NSMutableDictionary<NSString *, NSString *> *REBlockedRows(UITableView *t
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     return m;
+}
+
+static NSMutableIndexSet *REBlockedRowsInSection(UITableView *tv, NSInteger section, BOOL create) {
+    NSMutableDictionary *m = REBlockedRowsMap(tv, create);
+    if (!m) return nil;
+    NSNumber *key = @(section);
+    NSMutableIndexSet *rows = m[key];
+    if (!rows && create) {
+        rows = [NSMutableIndexSet indexSet];
+        m[key] = rows;
+    }
+    return rows;
 }
 
 static NSMutableIndexSet *REKeptSections(UITableView *tv, BOOL create) {
@@ -733,55 +744,53 @@ static NSMutableIndexSet *REKeptSections(UITableView *tv, BOOL create) {
     return set;
 }
 
-static NSString *REDrawerSignature(UITableView *tv) {
+// 结构指纹（分区数 + 总行数）。结构一变，之前记的行号就不可信 → 全部清空。
+static long REDrawerSignatureValue(UITableView *tv) {
     NSInteger sections = (NSInteger)tv.numberOfSections;
-    NSInteger total = 0;
+    long total = 0;
     for (NSInteger i = 0; i < sections; i++) {
-        total += [tv numberOfRowsInSection:i];
+        total += (long)[tv numberOfRowsInSection:i];
     }
-    return [NSString stringWithFormat:@"%ld/%ld", (long)sections, (long)total];
+    return (long)sections * 100000L + total;
 }
 
 static void REValidateDrawerState(UITableView *tv) {
     if (!tv) return;
-    NSString *sig = REDrawerSignature(tv);
-    NSString *old = objc_getAssociatedObject(tv, &kREDrawerSigKey);
-    if (old && ![old isEqualToString:sig]) {
+    long sig = REDrawerSignatureValue(tv);
+    NSNumber *old = objc_getAssociatedObject(tv, &kREDrawerSigKey);
+    if (old && old.longValue != sig) {
         objc_setAssociatedObject(tv, &kREBlockedRowsKey, nil,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(tv, &kREKeptSectionsKey, nil,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    if (!old || ![old isEqualToString:sig]) {
-        objc_setAssociatedObject(tv, &kREDrawerSigKey, sig,
+    if (!old || old.longValue != sig) {
+        objc_setAssociatedObject(tv, &kREDrawerSigKey, @(sig),
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 }
 
 static BOOL REIsRowBlocked(UITableView *tv, NSIndexPath *ip) {
-    NSMutableDictionary *m = REBlockedRows(tv, NO);
-    return m != nil && m[RERowKeyFor(ip)] != nil;
+    NSMutableIndexSet *rows = REBlockedRowsInSection(tv, ip.section, NO);
+    return rows != nil && [rows containsIndex:ip.row];
 }
 
 static void REBlockRow(UITableView *tv, NSIndexPath *ip, NSString *reason) {
     if (!tv || !ip) return;
-    NSMutableDictionary *m = REBlockedRows(tv, YES);
-    NSString *key = RERowKeyFor(ip);
-    if (m[key]) return;
-    m[key] = reason.length ? reason : @"?";
+    NSMutableIndexSet *rows = REBlockedRowsInSection(tv, ip.section, YES);
+    if (!rows || [rows containsIndex:ip.row]) return;
+    [rows addIndex:ip.row];
     gCntDrawerRowsHidden++;
-    RELogOnce([@"row|" stringByAppendingString:key],
+    RELogOnce([NSString stringWithFormat:@"row|%ld.%ld", (long)ip.section, (long)ip.row],
               @"隐藏抽屉行 section=%ld row=%ld ← %@",
               (long)ip.section, (long)ip.row, reason);
     RELayoutNudge(tv);
 }
 
 static void REUnblockRow(UITableView *tv, NSIndexPath *ip) {
-    NSMutableDictionary *m = REBlockedRows(tv, NO);
-    if (!m || !ip) return;
-    NSString *key = RERowKeyFor(ip);
-    if (!m[key]) return;
-    [m removeObjectForKey:key];
+    NSMutableIndexSet *rows = REBlockedRowsInSection(tv, ip.section, NO);
+    if (!rows || ![rows containsIndex:ip.row]) return;
+    [rows removeIndex:ip.row];
     RELayoutNudge(tv);
 }
 
