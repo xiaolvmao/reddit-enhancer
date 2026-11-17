@@ -364,7 +364,10 @@ static BOOL REDefaultForIndex(NSInteger i) {
             }
         }
     }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     return UIApplication.sharedApplication.keyWindow;
+#pragma clang diagnostic pop
 }
 
 + (UIViewController *)re_topViewController {
@@ -436,9 +439,9 @@ __attribute__((constructor)) static void REInitialize(void) {
         REInstallNetworkHook();
         REInstallJSONHook();
 
-        // Install the floating entry when the UI is ready. The observer token
-        // is retained in a static so it is never deallocated.
-        static id reActiveObserver = nil;
+        // Observer token kept alive for the app's lifetime so it is never
+        // deallocated. __unused silences the -Werror unused-but-set warning.
+        __unused static id reActiveObserver = nil;
         void (^install)(void) = ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
