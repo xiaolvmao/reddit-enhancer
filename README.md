@@ -28,15 +28,22 @@
 
 ## 二、功能 / 开关
 
-悬浮 **RE** 按钮（可拖动）→ 点开原生开关面板，所有开关**即时生效**，无需重启 App：
+进入 App 的**设置页**（Settings）→ 右上角出现 **「增强设置」** 按钮 → 点开即为原生开关二级菜单，**全中文、全部即时生效**，无需重启 App。
 
-1. **Remove Ads / Promoted**（默认开）— 过滤推广帖、`AdPost`、`CellGroup.adPayload`、广告容器
-2. **Hide Recommended Posts** — 过滤推荐/相似帖子注入
-3. **Block NSFW Content** — 屏蔽 NSFW 帖
-4. **Hide Awards** — 隐藏帖子/评论的 Awards 徽章
-5. **Hide Vote Scores** — 隐藏票数（利用 `isScoreHidden`）
-6. **Auto-collapse AutoMod** — 自动折叠 AutoMod 评论
-7. **Hide Premium Upsells** — 移除 Premium 推广 cell
+**内容过滤**
+1. **去除广告与推广**（默认开）— 过滤推广帖、`AdPost`、`CellGroup.adPayload`、广告容器
+2. **隐藏推荐内容** — 过滤推荐/相似帖子注入
+3. **屏蔽 NSFW 内容** — 屏蔽 NSFW 帖
+
+**界面精简**
+4. **隐藏赞赏徽章** — 隐藏帖子/评论的 Awards 徽章
+5. **隐藏投票数** — 隐藏票数（利用 `isScoreHidden`）
+6. **自动折叠 AutoMod** — 自动折叠 AutoMod 评论
+7. **隐藏 Premium 推广** — 移除 Premium 推广 cell
+
+> 入口实现：由于 2026.46.0 的设置页已改为纯 SwiftUI（无 `AppSettingsViewController` 等 UIKit 类可 Hook），
+> 插件改为 Hook 系统 `UIViewController.viewDidAppear:`，在检测到设置页时于其导航栏注入「增强设置」按钮。
+> 不依赖任何 Reddit 私有类，因此不受 App 内部重构影响。旧版的悬浮 RE 按钮已移除。
 
 其他优化（已内置、无需开关）：
 - Hook `NSURLSession` + `NSJSONSerialization` 双通道，覆盖同步回调与 Swift async/await 两条网络路径；
