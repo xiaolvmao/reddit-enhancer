@@ -511,7 +511,7 @@ static NSInteger REBumpSectionHit(UITableView *tv, NSInteger section) {
 // 一旦数量变了，之前记下的下标就不可信 → 立刻清空，重新探测。
 static void REValidateHiddenSet(UITableView *tv) {
     NSMutableIndexSet *set = RETableHiddenSet(tv, NO);
-    if (!set) return;
+    if (!set || set.count == 0) return;   // 没有折叠记录时零开销
     NSNumber *expected = objc_getAssociatedObject(tv, &kRESectionCountKey);
     if (expected && expected.integerValue != (NSInteger)tv.numberOfSections) {
         [set removeAllIndexes];
