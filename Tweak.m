@@ -1,23 +1,24 @@
 //
-//  RedditEnhancer — TrollStore / jailed tweak for Reddit 2026.46.0
+//  RedditEnhancer — TrollStore tweak for Reddit 2026.46.0
 //  Bundle ID: com.reddit.Reddit   Executable: RedditApp
 //
-//  Strategy (chosen after static analysis of the real 2026.46.0 binary):
-//   * The app is a 194 MB pure-Swift, heavily modularised Mach-O. Almost every
-//     class is a Swift mangled symbol (_TtC...) which CANNOT be hooked with
-//     the classic Objective-C Method Swizzling used by old tweaks.
-//   * The one stable, Objective-C visible hook point is NSURLSession's
-//     -dataTaskWithRequest:completionHandler:. Reddit still fetches its
-//     GraphQL feed through it, and the ad payload is delivered as JSON.
-//     All verified ad/filter JSON keys (adPayload, AdPost, SubredditPost,
-//     CellGroup, recommendationContext, isScoreHidden, awardings, isHidden,
-//     isNsfw, isInitiallyCollapsed) exist in this exact binary.
-//   * The old UIKit settings classes (AppSettingsViewController,
-//     UserDrawerViewController) are GONE in 2026.46.0 (settings is SwiftUI).
-//     Therefore the settings UI is 100% self-contained UIKit, presented from
-//     a floating, draggable entry button. No app-private class is needed.
+//  Strategy (based on static analysis of the real 2026.46.0 binary):
+//   * The app is a pure-Swift, heavily modularised Mach-O. Almost every class
+//     is a mangled Swift symbol (_TtC...) that cannot be swizzled with classic
+//     Objective-C method swizzling.
+//   * Stable hook point #1: NSURLSession -dataTaskWithRequest:completionHandler:
+//     Reddit still fetches GraphQL through it; ads arrive as JSON.
+//   * Stable hook point #2: NSJSONSerialization +JSONObjectWithData:options:error:
+//     catches Swift async/await URLSession requests too. Verified keys from the
+//     binary: adPayload, AdPost, CellGroup, recommendationContext,
+//     isScoreHidden, awardings, isHidden, isNsfw, isInitiallyCollapsed.
+//   * Settings UI in 2026.46.0 is pure SwiftUI (no AppSettingsViewController).
+//     Instead of a floating button, we hook UIViewController's viewDidAppear:
+//     (a UIKit system method) and, when the Reddit Settings screen appears,
+//     inject a "增强设置" bar button into its navigation bar. Tapping it opens
+//     our native UISwitch二级菜单. No app-private class is required.
 //
-//  Build: Theos (rootless / TrollStore). See Makefile and README.md.
+//  Build: Theos library.mk -> plain dylib, no Substrate dependency.
 //
 
 #import <Foundation/Foundation.h>
@@ -25,15 +26,15 @@
 #import <objc/runtime.h>
 
 // ---------------------------------------------------------------------------
-// Preferences — stored in the app's own sandbox, read live (no respring).
+// 偏好设置 — 存于 App 沙盒，实时读取（无需重启）
 // ---------------------------------------------------------------------------
-static NSString *const kREFilterPromoted   = @"RE.filter.promoted";    // 去广告/推广帖
-static NSString *const kREFilterRecommended= @"RE.filter.recommended"; // 过滤推荐内容
-static NSString *const kREFilterNSFW       = @"RE.filter.nsfw";        // 屏蔽 NSFW
-static NSString *const kREHideAwards       = @"RE.hide.awards";        // 隐藏 Awards
-static NSString *const kREHideScores       = @"RE.hide.scores";        // 隐藏票数
-static NSString *const kRECollapseAutoMod  = @"RE.collapse.automod";   // 折叠 AutoMod
-static NSString *const kREHidePremium      = @"RE.hide.premium";       // 隐藏 Premium 推广
+static NSString *const kREFilterPromoted   = @"RE.filter.promoted";
+static NSString *const kREFilterRecommended= @"RE.filter.recommended";
+static NSString *const kREFilterNSFW       = @"RE.filter.nsfw";
+static NSString *const kREHideAwards       = @"RE.hide.awards";
+static NSString *const kREHideScores       = @"RE.hide.scores";
+static NSString *const kRECollapseAutoMod  = @"RE.collapse.automod";
+static NSString *const kREHidePremium      = @"RE.hide.premium";
 
 static inline BOOL REBool(NSString *key, BOOL fallback) {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -42,16 +43,15 @@ static inline BOOL REBool(NSString *key, BOOL fallback) {
 }
 
 // ---------------------------------------------------------------------------
-// JSON filter — mutates the mutable GraphQL response in place.
-// This is the same battle-tested approach used by level3tjg/RedditFilter
-// (MIT), updated with the keys that actually exist in 2026.46.0.
+// JSON 过滤 — 就地修改可变的 GraphQL 响应
+// 思路参考 level3tjg/RedditFilter (MIT)，针对 2026.46.0 实际结构重写
 // ---------------------------------------------------------------------------
 static void REFilterNode(NSMutableDictionary *node) {
     if (![node isKindOfClass:NSMutableDictionary.class]) return;
     id rawType = node[@"__typename"];
     NSString *type = [rawType isKindOfClass:NSString.class] ? rawType : nil;
 
-    // Regular feed post
+    // 普通帖子
     if ([type isEqualToString:@"SubredditPost"] || [type hasSuffix:@"Post"]) {
         if (REBool(kREHideAwards, NO)) {
             node[@"awardings"] = @[];
@@ -65,7 +65,7 @@ static void REFilterNode(NSMutableDictionary *node) {
         }
     }
 
-    // Promoted / ad posts are injected as their own typenames
+    // 广告/推广帖以独立 typename 注入
     if (REBool(kREFilterPromoted, YES)) {
         if ([type hasSuffix:@"AdPost"] || [type hasPrefix:@"PROMOTED"] ||
             [type isEqualToString:@"REDDIT_PROMOTED"]) {
@@ -73,7 +73,7 @@ static void REFilterNode(NSMutableDictionary *node) {
         }
     }
 
-    // Comments
+    // 评论
     if ([type isEqualToString:@"Comment"]) {
         if (REBool(kREHideAwards, NO)) {
             node[@"awardings"] = @[];
@@ -88,7 +88,7 @@ static void REFilterNode(NSMutableDictionary *node) {
         }
     }
 
-    // CellGroup: this is how 2026.46.0 delivers ads & recommendations inline
+    // CellGroup: 2026.46.0 用它在信息流内注入广告和推荐
     if ([type isEqualToString:@"CellGroup"]) {
         NSArray *cells = node[@"cells"];
         BOOL shouldStripCells = NO;
@@ -106,7 +106,6 @@ static void REFilterNode(NSMutableDictionary *node) {
                     }
                     if (REBool(kREHideScores, NO)) cell[@"isScoreHidden"] = @YES;
                 }
-                // Premium / "get coins" upsell cells
                 if (REBool(kREHidePremium, NO) &&
                     ([cellType rangeOfString:@"premium" options:NSCaseInsensitiveSearch].location != NSNotFound ||
                      [cellType rangeOfString:@"upsell" options:NSCaseInsensitiveSearch].location != NSNotFound)) {
@@ -114,12 +113,10 @@ static void REFilterNode(NSMutableDictionary *node) {
                 }
             }
         }
-        // Inline ad: adPayload is present on 2026.46.0 (verified in binary)
         if (REBool(kREFilterPromoted, YES) &&
             [node[@"adPayload"] isKindOfClass:NSDictionary.class]) {
             shouldStripCells = YES;
         }
-        // Recommended / "similar posts" injection
         if (REBool(kREFilterRecommended, NO)) {
             NSDictionary *rc = node[@"recommendationContext"];
             if ([rc isKindOfClass:NSDictionary.class] &&
@@ -130,9 +127,7 @@ static void REFilterNode(NSMutableDictionary *node) {
         if (shouldStripCells) node[@"cells"] = @[];
     }
 
-    // Top-level ad / recommendation containers.
-    // 2026.46.0 changed some of these; we match generically by key name so the
-    // filter keeps working when Reddit renames a specific field.
+    // 顶层广告/推荐容器：按键名通用匹配，Reddit 改字段名时仍可工作
     for (NSString *key in [node.allKeys copy]) {
         id value = node[key];
         NSString *lower = key.lowercaseString;
@@ -149,7 +144,7 @@ static void REFilterNode(NSMutableDictionary *node) {
 }
 
 static void REWalkJSON(id obj, NSUInteger depth) {
-    if (depth > 16) return;   // guard against pathological nesting
+    if (depth > 16) return;
     if ([obj isKindOfClass:NSMutableArray.class]) {
         for (id item in (NSMutableArray *)obj) REWalkJSON(item, depth + 1);
     } else if ([obj isKindOfClass:NSArray.class]) {
@@ -162,10 +157,10 @@ static void REWalkJSON(id obj, NSUInteger depth) {
 }
 
 // ---------------------------------------------------------------------------
-// Hook NSURLSession (the only ObjC-visible network class in this binary)
+// Hook #1: NSURLSession
 // ---------------------------------------------------------------------------
 static IMP gOriginalDataTask = NULL;
-static _Thread_local BOOL gREInFilter = NO;   // recursion guard, per-thread
+static _Thread_local BOOL gREInFilter = NO;
 
 typedef NSURLSessionDataTask *(*REDataTaskIMP)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *));
 
@@ -212,11 +207,7 @@ static void REInstallNetworkHook(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Secondary universal interception: NSJSONSerialization.
-// 2026.46.0 also uses Swift `URLSession.data(for:delegate:)` (async/await)
-// which bypasses the completion-handler hook above. Every GraphQL payload is
-// eventually deserialized through NSJSONSerialization, so hooking it catches
-// those requests too. We force mutable containers so REWalkJSON can filter.
+// Hook #2: NSJSONSerialization — 覆盖 Swift async/await 网络路径
 // ---------------------------------------------------------------------------
 static IMP gOriginalJSONObject = NULL;
 
@@ -224,11 +215,8 @@ typedef id (*REJSONObjectIMP)(id, SEL, NSData *, NSJSONReadingOptions, NSError *
 
 static id REHookedJSONObject(id self, SEL _cmd, NSData *data,
                              NSJSONReadingOptions options, NSError **error) {
-    // Only touch payloads that look like a Reddit GraphQL response. This keeps
-    // the global hook cheap and avoids altering analytics/SDK JSON.
     BOOL looksLikeFeed = NO;
     if (data && data.length >= 8) {
-        // Use NSData range search: data.bytes is NOT guaranteed NUL-terminated.
         NSArray<NSData *> *markers = @[
             [@"__typename" dataUsingEncoding:NSUTF8StringEncoding],
             [@"adPayload"  dataUsingEncoding:NSUTF8StringEncoding],
@@ -244,8 +232,6 @@ static id REHookedJSONObject(id self, SEL _cmd, NSData *data,
         return ((REJSONObjectIMP)gOriginalJSONObject)(self, _cmd, data, options, error);
     }
 
-    // Force mutable containers so REWalkJSON can filter in place. Returning a
-    // mutable object where an immutable one was expected is safe (subclass).
     id result = ((REJSONObjectIMP)gOriginalJSONObject)(self, _cmd, data,
                                                        options | NSJSONReadingMutableContainers,
                                                        error);
@@ -269,47 +255,91 @@ static void REInstallJSONHook(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Self-contained settings UI (native iOS switches) + floating entry button
+// 设置数据（全中文）
 // ---------------------------------------------------------------------------
-@interface RESettingsViewController : UITableViewController
-@end
-
 static NSArray<NSString *> *RESettingKeys(void) {
     return @[kREFilterPromoted, kREFilterRecommended, kREFilterNSFW,
              kREHideAwards, kREHideScores, kRECollapseAutoMod, kREHidePremium];
 }
 
 static NSArray<NSString *> *RESettingTitles(void) {
-    return @[@"Remove Ads / Promoted", @"Hide Recommended Posts", @"Block NSFW Content",
-             @"Hide Awards", @"Hide Vote Scores", @"Auto-collapse AutoMod",
-             @"Hide Premium Upsells"];
+    return @[@"去除广告与推广", @"隐藏推荐内容", @"屏蔽 NSFW 内容",
+             @"隐藏赞赏徽章", @"隐藏投票数", @"自动折叠 AutoMod", @"隐藏 Premium 推广"];
 }
 
 static NSArray<NSString *> *RESettingSubtitles(void) {
-    return @[@"Strip promoted posts, ads and sponsored cells",
-             @"Remove suggested / similar post injections",
-             @"Hide NSFW posts from your feeds",
-             @"Remove award badges from posts and comments",
-             @"Hide upvote/downvote counts",
-             @"Fold AutoMod comments automatically",
-             @"Remove Reddit Premium banners and prompts"];
+    return @[@"移除推广帖、广告和赞助内容",
+             @"去除「相似帖子」等推荐注入",
+             @"从信息流中隐藏 NSFW 内容",
+             @"移除帖子和评论的赞赏徽章",
+             @"隐藏点赞／点踩数量",
+             @"自动折叠 AutoMod 机器人的评论",
+             @"移除 Reddit Premium 横幅和提示"];
 }
 
-static BOOL REDefaultForIndex(NSInteger i) {
-    return (i == 0); // only ad removal is on by default
+static BOOL REDefaultForIndex(NSInteger i) { return (i == 0); }  // 仅去广告默认开
+
+// 两个分组：内容过滤 / 界面精简
+static NSInteger RESectionCount(void) { return 2; }
+static NSInteger RERowsInSection(NSInteger section) { return section == 0 ? 3 : 4; }
+static NSInteger REGlobalIndex(NSIndexPath *indexPath) {
+    return indexPath.section == 0 ? indexPath.row : 3 + indexPath.row;
 }
+
+// ---------------------------------------------------------------------------
+// 二级菜单：原生开关列表
+// ---------------------------------------------------------------------------
+@interface RESettingsViewController : UITableViewController
+@end
 
 @interface REUIHelper : NSObject
 + (void)openSettings;
-+ (void)entryTapped:(id)sender;
-+ (void)entryPanned:(UIPanGestureRecognizer *)gesture;
 @end
+
+// Hook UIViewController.viewDidAppear: — 设置页出现时注入导航栏入口
+static IMP gOriginalViewDidAppear = NULL;
+static char kREEntryAssociatedKey;
+
+static void REHookedViewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (gOriginalViewDidAppear)
+        ((void (*)(id, SEL, BOOL))gOriginalViewDidAppear)(self, _cmd, animated);
+
+    UIViewController *vc = (UIViewController *)self;
+    if (![vc isKindOfClass:UIViewController.class]) return;
+    if ([vc isKindOfClass:[RESettingsViewController class]]) return;  // 排除我们自己的页面
+    if (!vc.navigationController) return;                 // 只在有导航栏的页面注入
+    if (objc_getAssociatedObject(vc, &kREEntryAssociatedKey)) return;  // 已注入
+
+    // 设置页是 SwiftUI（AppSettingsView -> UIHostingController），运行时类名
+    // 不一定稳定，因此标题/类名都做大小写不敏感的宽松匹配：只要出现在本 App
+    // 任意「设置」相关页面就注入入口，确保用户一定能找到。
+    NSString *title = vc.navigationItem.title ?: @"";
+    NSString *cls = NSStringFromClass([vc class]);
+    NSString *hay = [NSString stringWithFormat:@"%@ %@", title, cls].lowercaseString;
+    BOOL isSettingsPage = [hay containsString:@"settings"] || [hay containsString:@"设置"];
+    if (!isSettingsPage) return;
+
+    UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"增强设置"
+                                                           style:UIBarButtonItemStylePlain
+                                                          target:[REUIHelper class]
+                                                          action:@selector(openSettings)];
+    NSArray *right = vc.navigationItem.rightBarButtonItems;
+    vc.navigationItem.rightBarButtonItems = right.count ? [right arrayByAddingObject:btn] : @[btn];
+    objc_setAssociatedObject(vc, &kREEntryAssociatedKey, btn, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void REInstallUIHook(void) {
+    Method m = class_getInstanceMethod([UIViewController class], @selector(viewDidAppear:));
+    if (!m) return;
+    gOriginalViewDidAppear = method_getImplementation(m);
+    method_setImplementation(m, (IMP)REHookedViewDidAppear);
+}
 
 @implementation RESettingsViewController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Reddit Enhancer";
+    self.title = @"增强设置";
     self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
                                                        target:self
@@ -319,31 +349,35 @@ static BOOL REDefaultForIndex(NSInteger i) {
 
 - (void)re_done { [self dismissViewControllerAnimated:YES completion:nil]; }
 
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 1; }
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return RESectionCount(); }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return RESettingKeys().count;
+    return RERowsInSection(section);
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    return section == 0 ? @"内容过滤" : @"界面精简";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"RECell" forIndexPath:indexPath];
-    NSInteger row = indexPath.row;
-    cell.textLabel.text = RESettingTitles()[row];
-    cell.detailTextLabel.text = RESettingSubtitles()[row];
+    NSInteger idx = REGlobalIndex(indexPath);
+    cell.textLabel.text = RESettingTitles()[idx];
+    cell.detailTextLabel.text = RESettingSubtitles()[idx];
     cell.detailTextLabel.numberOfLines = 2;
-    cell.detailTextLabel.textColor = [UIColor respondsToSelector:@selector(secondaryLabelColor)]
-        ? UIColor.secondaryLabelColor : [UIColor darkGrayColor];
+    cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     UISwitch *sw = [[UISwitch alloc] init];
-    sw.on = REBool(RESettingKeys()[row], REDefaultForIndex(row));
-    sw.tag = row;
+    sw.on = REBool(RESettingKeys()[idx], REDefaultForIndex(idx));
+    sw.tag = idx;
     [sw addTarget:self action:@selector(re_toggle:) forControlEvents:UIControlEventValueChanged];
     cell.accessoryView = sw;
     return cell;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    return @"Toggles apply instantly to feed requests — no restart needed.\nReddit Enhancer for Reddit 2026.46.0 (TrollStore).";
+    if (section != RESectionCount() - 1) return nil;
+    return @"开关即时生效，无需重启 App。\nReddit 增强 · 适用于 Reddit 2026.46.0（巨魔）";
 }
 
 - (void)re_toggle:(UISwitch *)sender {
@@ -358,7 +392,8 @@ static BOOL REDefaultForIndex(NSInteger i) {
 + (UIWindow *)re_keyWindow {
     if (@available(iOS 13.0, *)) {
         for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-            if ([scene isKindOfClass:UIWindowScene.class] && scene.activationState == UISceneActivationStateForegroundActive) {
+            if ([scene isKindOfClass:UIWindowScene.class] &&
+                scene.activationState == UISceneActivationStateForegroundActive) {
                 for (UIWindow *w in ((UIWindowScene *)scene).windows)
                     if (w.isKeyWindow) return w;
             }
@@ -385,44 +420,6 @@ static BOOL REDefaultForIndex(NSInteger i) {
     [top presentViewController:nav animated:YES completion:nil];
 }
 
-+ (void)entryTapped:(id)sender { [self openSettings]; }
-
-+ (void)entryPanned:(UIPanGestureRecognizer *)gesture {
-    UIView *view = gesture.view;
-    UIWindow *window = [self re_keyWindow];
-    CGPoint delta = [gesture translationInView:window];
-    CGPoint center = view.center;
-    center.x += delta.x;
-    center.y += delta.y;
-    CGFloat m = 28.0;
-    center.x = MAX(m, MIN(window.bounds.size.width - m, center.x));
-    center.y = MAX(m, MIN(window.bounds.size.height - m, center.y));
-    view.center = center;
-    [gesture setTranslation:CGPointZero inView:window];
-}
-
-+ (void)installEntry {
-    UIWindow *window = [self re_keyWindow];
-    if (!window || [window viewWithTag:0x5245]) return;   // 0x5245 = "RE"
-    CGFloat size = 46.0;
-    UIButton *button = [[UIButton alloc] initWithFrame:CGRectMake(window.bounds.size.width - size - 18,
-                                                                  window.bounds.size.height * 0.32,
-                                                                  size, size)];
-    button.tag = 0x5245;
-    button.layer.cornerRadius = size / 2;
-    button.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.82];
-    button.layer.shadowColor = UIColor.blackColor.CGColor;
-    button.layer.shadowOpacity = 0.35;
-    button.layer.shadowRadius = 6;
-    button.layer.shadowOffset = CGSizeMake(0, 2);
-    [button setTitle:@"RE" forState:UIControlStateNormal];
-    button.titleLabel.font = [UIFont boldSystemFontOfSize:16];
-    [button addTarget:self action:@selector(entryTapped:) forControlEvents:UIControlEventTouchUpInside];
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(entryPanned:)];
-    [button addGestureRecognizer:pan];
-    [window addSubview:button];
-}
-
 @end
 
 // ---------------------------------------------------------------------------
@@ -430,7 +427,6 @@ static BOOL REDefaultForIndex(NSInteger i) {
 // ---------------------------------------------------------------------------
 __attribute__((constructor)) static void REInitialize(void) {
     @autoreleasepool {
-        // register defaults
         NSMutableDictionary *defaults = [NSMutableDictionary dictionary];
         NSArray *keys = RESettingKeys();
         for (NSUInteger i = 0; i < keys.count; i++) defaults[keys[i]] = @(REDefaultForIndex(i));
@@ -438,20 +434,6 @@ __attribute__((constructor)) static void REInitialize(void) {
 
         REInstallNetworkHook();
         REInstallJSONHook();
-
-        // Observer token kept alive for the app's lifetime so it is never
-        // deallocated. __unused silences the -Werror unused-but-set warning.
-        __unused static id reActiveObserver = nil;
-        void (^install)(void) = ^{
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                [REUIHelper installEntry];
-            });
-        };
-        reActiveObserver = [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                        object:nil
-                                                         queue:NSOperationQueue.mainQueue
-                                                    usingBlock:^(NSNotification *note) { install(); }];
-        install();
+        REInstallUIHook();
     }
 }
