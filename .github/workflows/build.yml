@@ -35,9 +35,10 @@ jobs:
           cp "$DYLIB" artifacts/
           echo "--- dylib info ---"
           file "artifacts/RedditEnhancer.dylib"
-          lipo -info "artifacts/RedditEnhancer.dylib"
+          # lipo/otool are macOS-only; show them when available (non-fatal on Linux).
+          lipo -info "artifacts/RedditEnhancer.dylib" 2>/dev/null || true
           echo "--- linked libraries (must NOT contain substrate/ellekit) ---"
-          otool -L "artifacts/RedditEnhancer.dylib" || true
+          otool -L "artifacts/RedditEnhancer.dylib" 2>/dev/null || true
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
