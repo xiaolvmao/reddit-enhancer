@@ -470,6 +470,18 @@ static BOOL REDrawerRowShouldBlock(NSString *ident, NSString *text) {
     return NO;
 }
 
+// 「明确」是保留行（六个入口之一）。只有这种行才允许把整个分区解折；
+// 只是「没认出来」的行不行 —— 否则 About 那种整段该折的分区会被单个
+// 未知行给拉回来（v6 初版就栽在这）。
+static BOOL REDrawerRowIsKeptMarked(NSString *ident, NSString *text) {
+    NSString *lowIdent = [ident isKindOfClass:NSString.class] ? ident.lowercaseString : @"";
+    if (lowIdent.length && REMatchesAny(lowIdent, REDrawerKeepRowMarkers())) return YES;
+    if (lowIdent.length == 0 && [text isKindOfClass:NSString.class] && text.length) {
+        return REMatchesAny(text.lowercaseString, REDrawerKeepRowMarkers());
+    }
+    return NO;
+}
+
 // 这个分区标题要不要保留
 static BOOL REDrawerTitleShouldKeep(NSString *title) {
     if (![title isKindOfClass:NSString.class] || title.length == 0) return YES;
@@ -479,6 +491,15 @@ static BOOL REDrawerTitleShouldKeep(NSString *title) {
     if (low.length == 0) return YES;
     if (REMatchesAny(low, REDrawerJunkTitleWords())) return NO;
     return REMatchesAny(low, REDrawerKeepTitleWords());
+}
+
+// 只认「明确的垃圾标题」。分区头视图里的第一段文字不一定是分区标题
+// （可能是用户名、karma、按钮文案），那种情况只能按这个更保守的规则判定。
+static BOOL REDrawerTextIsJunkTitle(NSString *text) {
+    if (![text isKindOfClass:NSString.class] || text.length == 0) return NO;
+    NSString *low = text.lowercaseString;
+    if (REMatchesAny(low, REDrawerKeepTitleWords())) return NO;
+    return REMatchesAny(low, REDrawerJunkTitleWords());
 }
 
 // ---------------------------------------------------------------------------
@@ -809,14 +830,16 @@ static BOOL REApplyRowPolicy(UITableView *tv, UITableViewCell *cell, NSIndexPath
         return YES;
     }
 
-    // 这一行要保留，但它所在的分区被白名单按标题折掉了 → 解折（自愈）
-    NSMutableIndexSet *hidden = RETableHiddenSet(tv, NO);
-    if (hidden && [hidden containsIndex:ip.section]) {
-        [REKeptSections(tv, YES) addIndex:ip.section];
-        [hidden removeIndex:ip.section];
-        RELog(@"分区 #%ld 里出现了保留行，取消折叠（%@）",
-              (long)ip.section, ident.length ? ident : text);
-        RELayoutNudge(tv);
+    // 这一行是六个入口之一，但它所在的分区被白名单按标题折掉了 → 解折（自愈）
+    if (REBool(kREDrawerWhitelist, YES) && REDrawerRowIsKeptMarked(ident, text)) {
+        NSMutableIndexSet *hidden = RETableHiddenSet(tv, NO);
+        if (hidden && [hidden containsIndex:ip.section]) {
+            [REKeptSections(tv, YES) addIndex:ip.section];
+            [hidden removeIndex:ip.section];
+            RELog(@"分区 #%ld 里出现了保留行，取消折叠（%@）",
+                  (long)ip.section, ident.length ? ident : text);
+            RELayoutNudge(tv);
+        }
     }
     REUnblockRow(tv, ip);
 
@@ -829,8 +852,10 @@ static BOOL REApplyRowPolicy(UITableView *tv, UITableViewCell *cell, NSIndexPath
 }
 
 // 分区标题 / 分区头视图 → 决定要不要整段折叠
-static void REApplySectionPolicy(UITableView *tv, NSInteger section,
-                                 NSString *title, NSString *headerIdent) {
+// authoritative = YES：title 来自 titleForHeaderInSection，是真标题，可以做白名单判断
+// authoritative = NO ：文字来自头视图里的某段文本，只按「明确的垃圾词」判定
+static void REApplySectionPolicy(UITableView *tv, NSInteger section, NSString *title,
+                                 NSString *headerIdent, BOOL authoritative) {
     if (!tv || section < 0) return;
     if (!REBool(kREDrawerWhitelist, YES)) return;
 
@@ -857,7 +882,9 @@ static void REApplySectionPolicy(UITableView *tv, NSInteger section,
     }
 
     if ([title isKindOfClass:NSString.class] && title.length) {
-        if (!REDrawerTitleShouldKeep(title)) {
+        BOOL fold = authoritative ? !REDrawerTitleShouldKeep(title)
+                                  : REDrawerTextIsJunkTitle(title);
+        if (fold) {
             REMarkSectionHiddenEx(tv, section, @"白名单：标题不在保留列表", NO);
         }
         return;
@@ -942,7 +969,7 @@ static NSString *REHookTitleForHeader(id self, SEL _cmd, UITableView *tv, NSInte
     if (!RETableIsDrawer(tv)) return title;
 
     if (REBool(kREDrawerWhitelist, YES)) {
-        REApplySectionPolicy(tv, section, title, nil);
+        REApplySectionPolicy(tv, section, title, nil, YES);
         if (RESectionIsHidden(tv, section)) return nil;
         return title;
     }
@@ -967,7 +994,7 @@ static UIView *REHookViewForHeader(id self, SEL _cmd, UITableView *tv, NSInteger
 
     if (REBool(kREDrawerWhitelist, YES)) {
         REApplySectionPolicy(tv, section, REFirstTextInView(view, 0),
-                            view.accessibilityIdentifier);
+                            view.accessibilityIdentifier, NO);
         if (RESectionIsHidden(tv, section)) {
             view.hidden = YES;
             return nil;
@@ -1027,7 +1054,7 @@ static void REHookWillDisplayHeader(id self, SEL _cmd, UITableView *tv,
 
     if (REBool(kREDrawerWhitelist, YES)) {
         REApplySectionPolicy(tv, section, REFirstTextInView(view, 0),
-                            view.accessibilityIdentifier);
+                            view.accessibilityIdentifier, NO);
         if (RESectionIsHidden(tv, section)) view.hidden = YES;
         return;
     }
