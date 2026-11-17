@@ -347,6 +347,22 @@ static void REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *re
     NSMutableIndexSet *set = RETableHiddenSet(tv, YES);
     if ([set containsIndex:section]) return;
 
+    // 安全阀：分区行数过多说明它是「整个抽屉」而不是独立的推广分区，
+    // 这时只做视觉隐藏，绝不整段清空（否则会把侧边栏清空）
+    id ds = tv.dataSource;
+    if (ds) {
+        SEL sel = @selector(tableView:numberOfRowsInSection:);
+        NSInteger (*fn)(id, SEL, UITableView *, NSInteger) = (void *)REOriIMP(ds, sel);
+        if (fn) {
+            NSInteger rows = fn(ds, sel, tv, section);
+            if (rows > 14) {
+                RELog(@"分区 #%ld 有 %ld 行，判定为非独立推广分区，跳过整段移除（%@）",
+                      (long)section, (long)rows, reason);
+                return;
+            }
+        }
+    }
+
     [set addIndex:section];
     gCntSectionsHidden++;
 
