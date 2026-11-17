@@ -1,0 +1,7 @@
+# Force LF for build files so macOS runners parse the Makefile and workflow correctly.
+* text=auto eol=lf
+*.m text eol=lf
+Makefile text eol=lf
+control text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
