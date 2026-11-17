@@ -184,9 +184,10 @@ static NSArray<NSString *> *REGamesMarkers(void) {
              @"devvit", @"游戏"];
 }
 
-// 抽屉里「资源 / Reddit Pro / Premium」相关文案 / 标识（全部小写）
-// 注意：这里的词也会拿去匹配 cell 文案，所以只放「不可能出现在正常社区名里」的词，
-// 避免把用户订阅的社区误判成推广位。
+// 抽屉里「资源 / About / 规则 / 隐私 / 协议」相关文案 / 标识（全部小写）
+// 注意：这里的词也会拿去匹配 cell 文案，所以只放「不可能出现在正常社区名里」的词。
+// 像 "rules" / "about" / "privacy" 这种裸词一律不放 —— r/privacy、r/About 这类
+// 真实社区会被误判，进而把用户订阅列表整段折掉（v5 的事故点）。
 static NSArray<NSString *> *REResourceMarkers(void) {
     return @[@"resourcessection", @"resources", @"资源",
              // 广告合作 / 会员升级：都归到「资源」开关下
@@ -194,11 +195,12 @@ static NSArray<NSString *> *REResourceMarkers(void) {
              @"trypro", @"try pro", @"tryredditpro", @"reddit pro", @"protitle",
              @"premiumtitle", @"reddit premium", @"premiumupsell",
              @"prolinks", @"earntitle", @"vaulttitle",
-             @"rulestitle", @"reddit rules",
-             @"privacypolicy", @"privacy policy",
-             @"useragreement", @"user agreement",
-             @"osainformation", @"osa information",
-             @"acknowledgements", @"impressum", @"help center"];
+             // About 分区：关于 / 规则 / 隐私政策 / 用户协议 / 版权声明
+             @"aboutsection", @"rulestitle", @"privacypolicy", @"useragreement",
+             @"osainformation", @"acknowledgements", @"impressum",
+             @"helpcenter", @"help center", @"关于 reddit", @"关于reddit",
+             @"隐私政策", @"用户协议", @"服务条款", @"帮助中心", @"辅助功能",
+             @"版权", @"鸣谢"];
 }
 
 // 抽屉里「趋势 / Trending」相关（独立的开关）
@@ -210,6 +212,21 @@ static NSArray<NSString *> *RETrendingMarkers(void) {
 static NSArray<NSString *> *REAnswersMarkerList(void) {
     return @[@"askanswers", @"answersproductcard", @"answershero",
              @"answerspreview", @"answersdiscoveryunit"];
+}
+
+// 广告相关无障碍标识（取自二进制里的 UIIdentifier rawValue，全小写）
+static NSArray<NSString *> *REAdIdentifiers(void) {
+    return @[@"redditfeedpromotedpostcell",      // 信息流推广帖
+             @"redditpostpromotede",             // 推广帖内部元素（E11/E12…）
+             @"redditpostade",                   // 广告浮层
+             @"redditpostconvoad",                // 评论区会话广告
+             @"redditpostcommentad",              // 评论里的广告内容
+             @"redditpromotedcommunitypost",      // 推广社区帖
+             @"adpromotedcommunitypostcell",      // 推广社区 cell
+             @"conversationad",                   // 会话广告通用
+             @"hiddenadpost",                     // 「已隐藏广告」占位块
+             @"redditadsamaad",                   // AMA 广告状态条
+             @"redditpromotepostentrypoint"];     // 「推广你的帖子」入口
 }
 
 static BOOL REStringIsGamePromo(NSString *s) {
@@ -242,22 +259,40 @@ static NSSet<NSString *> *REPromoTitles(void) {
             @"resources", @"reddit pro", @"try pro", @"try reddit pro",
             @"reddit premium", @"premium", @"earn", @"vault", @"trends",
             @"trending", @"trending today", @"reddit answers", @"answers",
-            @"advertise on reddit", @"reddit rules", @"privacy policy",
-            @"user agreement", @"accessibility", @"help center",
-            @"acknowledgements", @"impressum", @"osa information",
+            @"advertise on reddit",
+            // About 分区（英文 / 中文两套本地化文案都收）
+            @"about", @"about reddit", @"reddit rules", @"rules",
+            @"privacy policy", @"user agreement", @"terms of service",
+            @"accessibility", @"help center", @"acknowledgements",
+            @"impressum", @"osa information",
+            @"关于", @"关于 reddit", @"关于reddit", @"规则", @"社区规则",
+            @"隐私政策", @"隐私权政策", @"用户协议", @"服务条款",
+            @"辅助功能", @"帮助中心", @"鸣谢", @"版权声明",
             @"games on reddit", @"discover more games", @"资源", @"游戏"
         ]];
     });
     return set;
 }
 
+// 标题命中「整串匹配表」即认定为推广分区，具体归哪个开关控制：
+// 游戏 → 游戏开关；趋势 → 趋势开关；Answers → Answers 开关；其余 → 资源开关。
 static BOOL RETitleIsPromo(NSString *title) {
     if (![title isKindOfClass:NSString.class] || title.length == 0) return NO;
     NSString *low = [title.lowercaseString
                      stringByTrimmingCharactersInSet:
                      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (![REPromoTitles() containsObject:low]) return NO;
-    return REStringIsPromo(low);
+
+    if ([low containsString:@"game"] || [low containsString:@"游戏"]) {
+        return REBool(kREHideDrawerGames, YES);
+    }
+    if ([low containsString:@"trend"]) {
+        return REBool(kREHideTrending, YES);
+    }
+    if ([low containsString:@"answer"]) {
+        return REBool(kREHideAnswers, YES);
+    }
+    return REBool(kREHideDrawerResources, YES);
 }
 
 // 递归读取视图树里的文案（Swift 自绘 cell 的类名往往没有信息量，
@@ -289,6 +324,19 @@ static BOOL REScanA11yInView(UIView *view, NSUInteger depth) {
         if (REScanA11yInView(sub, depth + 1)) return YES;
     }
     return NO;
+}
+
+// 真正的广告 cell（推广帖 / 推广社区 / 会话广告）——这类宁可留一条空白也要藏掉。
+// 「关于 / 规则 / 隐私政策 / 用户协议」这类不走逐行隐藏，统一走整段折叠，
+// 否则会留下「一大块空白」（v5.1 的问题）。
+static BOOL REViewIsAdCell(UIView *view) {
+    if (!view) return NO;
+    NSString *cls = NSStringFromClass([view class]).lowercaseString;
+    if ([cls containsString:@"promoted"] || [cls containsString:@"adcell"] ||
+        [cls containsString:@"adpost"] || [cls containsString:@"conversationad"]) {
+        return YES;
+    }
+    return REMatchesAny(view.accessibilityIdentifier, REAdIdentifiers());
 }
 
 // 判断一个 cell / header 视图是否是抽屉推广位
@@ -380,18 +428,11 @@ static char kREHiddenSectionsKey;
 static char kRENudgePendingKey;
 static char kREFiltersInstalledKey;
 
-// dataSource 类名 -> 已确认的推广分区（跨抽屉实例复用，避免每次打开闪一下）
-static NSMutableDictionary<NSString *, NSMutableIndexSet *> *gREHiddenByClass = nil;
-
-static NSObject *REHiddenLock(void) {
-    static NSObject *lock = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        lock = [[NSObject alloc] init];
-        gREHiddenByClass = [NSMutableDictionary dictionary];
-    });
-    return lock;
-}
+// 历史教训（v5）：这里曾用「dataSource 类名 → 已隐藏分区下标」的跨实例缓存来
+// 消除首次打开的一瞬闪现。但抽屉的分区顺序会变（登录态、游戏服务开关、
+// A/B 实验都会增减分区），缓存的下标一旦错位，就会折掉别的分区
+// ——表现为「抽屉里一大块空白，还影响了正常功能」。所以现在只按
+// 当前这个 tableView 的实时探测结果来折，绝不复用下标。
 
 static NSString *RETableClassKey(UITableView *tv) {
     id ds = tv.dataSource;
@@ -411,12 +452,7 @@ static NSMutableIndexSet *RETableHiddenSet(UITableView *tv, BOOL create) {
     if (!tv) return nil;
     NSMutableIndexSet *set = objc_getAssociatedObject(tv, &kREHiddenSectionsKey);
     if (!set && create) {
-        NSString *clsName = RETableClassKey(tv);
-        NSMutableIndexSet *seed = nil;
-        @synchronized (REHiddenLock()) {
-            seed = gREHiddenByClass[clsName];
-        }
-        set = seed ? [seed mutableCopy] : [NSMutableIndexSet indexSet];
+        set = [NSMutableIndexSet indexSet];
         objc_setAssociatedObject(tv, &kREHiddenSectionsKey, set,
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
@@ -448,13 +484,56 @@ static void RELayoutNudge(UITableView *tv) {
     });
 }
 
-static void REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *reason) {
-    if (!tv || section < 0) return;
+static char kRESectionCountKey;
+static char kRESectionHitKey;
+
+// 记录「这个分区里有几行命中了推广特征」。
+// 单行命中不足以折掉一个大分区（可能是误匹配），多行命中才说明整段就是推广区
+// ——「关于」分区有 10 行左右（规则/隐私/协议/辅助功能/帮助/鸣谢…），
+// 旧版 10 行的安全阀会把它判成「整块列表」而拒绝折叠，于是只剩一堆被隐藏的
+// 空行 = 用户看到的那一大块空白。
+static NSInteger REBumpSectionHit(UITableView *tv, NSInteger section) {
+    if (!tv) return 0;
+    NSMutableDictionary<NSNumber *, NSNumber *> *hits =
+        objc_getAssociatedObject(tv, &kRESectionHitKey);
+    if (!hits) {
+        hits = [NSMutableDictionary dictionary];
+        objc_setAssociatedObject(tv, &kRESectionHitKey, hits,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    NSNumber *key = @(section);
+    NSInteger next = hits[key].integerValue + 1;
+    hits[key] = @(next);
+    return next;
+}
+
+// 抽屉重新加载后分区数量可能变（登录、游戏服务、A/B 实验都会增减分区），
+// 一旦数量变了，之前记下的下标就不可信 → 立刻清空，重新探测。
+static void REValidateHiddenSet(UITableView *tv) {
+    NSMutableIndexSet *set = RETableHiddenSet(tv, NO);
+    if (!set) return;
+    NSNumber *expected = objc_getAssociatedObject(tv, &kRESectionCountKey);
+    if (expected && expected.integerValue != (NSInteger)tv.numberOfSections) {
+        [set removeAllIndexes];
+        objc_setAssociatedObject(tv, &kRESectionCountKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(tv, &kRESectionHitKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+// 返回 YES 表示「这个分区确实被折掉了」——调用方据此决定要不要隐藏视图，
+// 避免安全阀拦下之后还留一个空白洞。
+static BOOL REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *reason) {
+    if (!tv || section < 0) return NO;
     NSMutableIndexSet *set = RETableHiddenSet(tv, YES);
-    if (!set || [set containsIndex:section]) return;
+    if (!set) return NO;
+    if ([set containsIndex:section]) return YES;
 
     // 安全阀：分区行数过多说明它是「整块抽屉列表」而不是独立的推广分区，
     // 这时放弃折叠，避免因为一个 cell 文案匹配把整个侧边栏藏掉。
+    // 但如果同一个分区里已经有多行命中推广特征，那就不是误匹配 —— 允许折叠。
+    NSInteger hits = REBumpSectionHit(tv, section);
     id ds = tv.dataSource;
     if (ds) {
         SEL sel = @selector(tableView:numberOfRowsInSection:);
@@ -463,29 +542,21 @@ static void REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *re
                 (void *)[ds methodForSelector:sel];
             if (fn) {
                 NSInteger rows = fn(ds, sel, tv, section);
-                if (rows > 10) {
-                    RELog(@"分区 #%ld 有 %ld 行，判定为整块列表，跳过折叠（%@）",
-                          (long)section, (long)rows, reason);
-                    return;
+                if (rows > 14 && hits < 3) {
+                    RELog(@"分区 #%ld 有 %ld 行、命中 %ld 次，暂不折叠（%@）",
+                          (long)section, (long)rows, (long)hits, reason);
+                    return NO;
                 }
             }
         }
     }
 
     [set addIndex:section];
+    objc_setAssociatedObject(tv, &kRESectionCountKey, @(tv.numberOfSections),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     gCntSectionsHidden++;
 
-    NSString *clsName = RETableClassKey(tv);
-    @synchronized (REHiddenLock()) {
-        NSMutableIndexSet *cached = gREHiddenByClass[clsName];
-        if (!cached) {
-            cached = [NSMutableIndexSet indexSet];
-            gREHiddenByClass[clsName] = cached;
-        }
-        [cached addIndex:section];
-    }
-
-    RELog(@"折叠抽屉分区 #%ld（%@）ds=%@", (long)section, reason, clsName);
+    RELog(@"折叠抽屉分区 #%ld（%@）ds=%@", (long)section, reason, RETableClassKey(tv));
 
     // 已经显示出来的 cell 先直接藏掉，避免高度重算前闪一下
     for (UITableViewCell *cell in tv.visibleCells) {
@@ -497,6 +568,7 @@ static void REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *re
     }
 
     RELayoutNudge(tv);
+    return YES;
 }
 
 // --- 具体 hook ---
@@ -505,6 +577,7 @@ static void REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *re
 // NSInternalInconsistencyException（Invalid update）直接 abort —— 这是 v3 崩溃点。
 
 static CGFloat REHookHeightForRow(id self, SEL _cmd, UITableView *tv, NSIndexPath *indexPath) {
+    REValidateHiddenSet(tv);
     NSMutableIndexSet *set = RETableHiddenSet(tv, NO);
     if (set && [set containsIndex:indexPath.section]) return 0.0;
 
@@ -515,12 +588,34 @@ static CGFloat REHookHeightForRow(id self, SEL _cmd, UITableView *tv, NSIndexPat
 }
 
 static CGFloat REHookHeightForHeader(id self, SEL _cmd, UITableView *tv, NSInteger section) {
+    REValidateHiddenSet(tv);
     NSMutableIndexSet *set = RETableHiddenSet(tv, NO);
     if (set && [set containsIndex:section]) return 0.0;
 
     CGFloat (*orig)(id, SEL, UITableView *, NSInteger) = (void *)REOriIMP(self, _cmd);
     if (orig) return orig(self, _cmd, tv, section);
     return tv.sectionHeaderHeight;
+}
+
+// 分区被折掉之后，footer（「关于」下面那行版权/版本说明之类的留白）也必须归零，
+// 否则会剩下一大块空白 —— 这就是用户反馈的「抽屉里一大块空白」的另一半。
+static CGFloat REHookHeightForFooter(id self, SEL _cmd, UITableView *tv, NSInteger section) {
+    REValidateHiddenSet(tv);
+    NSMutableIndexSet *set = RETableHiddenSet(tv, NO);
+    if (set && [set containsIndex:section]) return 0.0;
+
+    CGFloat (*orig)(id, SEL, UITableView *, NSInteger) = (void *)REOriIMP(self, _cmd);
+    if (orig) return orig(self, _cmd, tv, section);
+    return tv.sectionFooterHeight;
+}
+
+static UIView *REHookViewForFooter(id self, SEL _cmd, UITableView *tv, NSInteger section) {
+    REValidateHiddenSet(tv);
+    NSMutableIndexSet *set = RETableHiddenSet(tv, NO);
+    if (set && [set containsIndex:section]) return nil;
+
+    UIView *(*orig)(id, SEL, UITableView *, NSInteger) = (void *)REOriIMP(self, _cmd);
+    return orig ? orig(self, _cmd, tv, section) : nil;
 }
 
 static NSString *REHookTitleForHeader(id self, SEL _cmd, UITableView *tv, NSInteger section) {
@@ -571,11 +666,13 @@ static UITableViewCell *REHookCellForRow(id self, SEL _cmd, UITableView *tv, NSI
 
     if (RETableIsDrawer(tv) && cell) {
         BOOL promo = REViewIsPromo(cell);
-        if (promo) REMarkSectionHidden(tv, indexPath.section, @"推广 cell");
-        // 即使安全阀拦下了整段折叠（说明推广 cell 混在正常分区里），
-        // 这个 cell 本身也必须消失 —— 否则「偶尔出现」的那条广告就漏出来了。
-        // 复用时要还原，避免把后面正常行也藏掉。
-        cell.hidden = promo;
+        BOOL folded = promo ? REMarkSectionHidden(tv, indexPath.section, @"推广 cell") : NO;
+        // 整段折掉时 cell 本来高度就是 0；折不掉时只有「真广告」才逐行藏，
+        // 其它（关于/规则/隐私/协议）保持原样，绝不靠隐藏行来凑，避免空白块。
+        // alpha 一并还原，否则复用到别的行会变成透明（看着就是一块空白）。
+        BOOL hide = folded || REViewIsAdCell(cell);
+        cell.hidden = hide;
+        cell.alpha = hide ? 0.0 : 1.0;
     }
     return cell;
 }
@@ -588,8 +685,10 @@ static void REHookWillDisplayCell(id self, SEL _cmd, UITableView *tv,
 
     if (RETableIsDrawer(tv) && cell) {
         BOOL promo = REViewIsPromo(cell);
-        if (promo) REMarkSectionHidden(tv, indexPath.section, @"cell 显示");
-        cell.hidden = promo;
+        BOOL folded = promo ? REMarkSectionHidden(tv, indexPath.section, @"cell 显示") : NO;
+        BOOL hide = folded || REViewIsAdCell(cell);
+        cell.hidden = hide;
+        cell.alpha = hide ? 0.0 : 1.0;
     }
 }
 
@@ -644,6 +743,10 @@ static void REInstallFiltersOnTable(UITableView *tableView) {
                           (IMP)REHookHeightForRow);
         RESwizzleInstance(obj, @selector(tableView:heightForHeaderInSection:),
                           (IMP)REHookHeightForHeader);
+        RESwizzleInstance(obj, @selector(tableView:heightForFooterInSection:),
+                          (IMP)REHookHeightForFooter);
+        RESwizzleInstance(obj, @selector(tableView:viewForFooterInSection:),
+                          (IMP)REHookViewForFooter);
         RESwizzleInstance(obj, @selector(tableView:titleForHeaderInSection:),
                           (IMP)REHookTitleForHeader);
         RESwizzleInstance(obj, @selector(tableView:viewForHeaderInSection:),
@@ -705,9 +808,6 @@ static void RECollectTables(UIView *view, NSUInteger depth, NSMutableArray *out)
 }
 
 static void REResetDrawerCache(void) {
-    @synchronized (REHiddenLock()) {
-        [gREHiddenByClass removeAllObjects];
-    }
     REWriteDrawerCollapseKeys();
 
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -720,7 +820,12 @@ static void REResetDrawerCache(void) {
             }
         }
         for (UITableView *tv in tables) {
+            // 重新探测：清掉旧下标和旧的分区数基准
             objc_setAssociatedObject(tv, &kREHiddenSectionsKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(tv, &kRESectionCountKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(tv, &kRESectionHitKey, nil,
                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             for (UITableViewCell *cell in tv.visibleCells) {
                 cell.hidden = NO;
@@ -1197,20 +1302,6 @@ static void REInstallReviewHook(void) {
 // ---------------------------------------------------------------------------
 // 广告相关无障碍标识（取自二进制里的 UIIdentifier rawValue，全小写）
 // 这是最后一道兜底：JSON 层没拦住的广告，至少不能显示出来。
-static NSArray<NSString *> *REAdIdentifiers(void) {
-    return @[@"redditfeedpromotedpostcell",      // 信息流推广帖
-             @"redditpostpromotede",             // 推广帖内部元素（E11/E12…）
-             @"redditpostade",                   // 广告浮层
-             @"redditpostconvoad",                // 评论区会话广告
-             @"redditpostcommentad",              // 评论里的广告内容
-             @"redditpromotedcommunitypost",      // 推广社区帖
-             @"adpromotedcommunitypostcell",      // 推广社区 cell
-             @"conversationad",                   // 会话广告通用
-             @"hiddenadpost",                     // 「已隐藏广告」占位块
-             @"redditadsamaad",                   // AMA 广告状态条
-             @"redditpromotepostentrypoint"];     // 「推广你的帖子」入口
-}
-
 static BOOL REIdentifierShouldHide(NSString *ident) {
     if (![ident isKindOfClass:[NSString class]] || ident.length == 0) return NO;
     NSString *low = ident.lowercaseString;
@@ -1283,8 +1374,8 @@ static NSArray<NSDictionary *> *RESettingsModel(void) {
                @"rows": @[
                     @{ @"k": kREHideDrawerGames,     @"t": @"隐藏「Reddit 上的游戏」",
                        @"s": @"折叠抽屉里的 Devvit 游戏推荐分区", @"d": @YES },
-                    @{ @"k": kREHideDrawerResources, @"t": @"隐藏「资源」推广区",
-                       @"s": @"折叠 Reddit Pro／Premium／广告合作等入口", @"d": @YES },
+                    @{ @"k": kREHideDrawerResources, @"t": @"隐藏「资源 / 关于」分区",
+                       @"s": @"去掉资源、Reddit Pro、Premium、关于、规则、隐私政策、用户协议", @"d": @YES },
                ]},
 
             @{ @"t": @"隐私与体验",
@@ -1872,6 +1963,6 @@ __attribute__((constructor)) static void REInitialize(void) {
         REWriteDrawerCollapseKeys();
         REDiscoverDrawerTables();
 
-        RELog(@"RedditEnhancer v5 已加载（hook %ld 个）", (long)gCntHooksInstalled);
+        RELog(@"RedditEnhancer v5.2 已加载（hook %ld 个）", (long)gCntHooksInstalled);
     }
 }
