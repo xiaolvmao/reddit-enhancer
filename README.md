@@ -63,7 +63,7 @@ git push -u origin HEAD:main
 ```
 
 3. 打开仓库的 **Actions** 标签页 → 选中本次提交触发的 **Build RedditEnhancer dylib**（若无则点 **Run workflow**）；
-4. 构建完成后，在该 run 页面底部 **Artifacts** 下载 `RedditEnhancer-dylib`，解压得到 `libRedditEnhancer.dylib`。
+4. 构建完成后，在该 run 页面底部 **Artifacts** 下载 `RedditEnhancer-dylib`，解压得到 `RedditEnhancer.dylib`。
 
 > workflow 会打印 `otool -L` 结果，确认其中**不含** `libsubstrate` / `libellekit` 即为纯 dylib，可直接用于 TrollStore 注入。
 
@@ -75,10 +75,10 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/i
 # 把 iPhoneOS16.5.sdk 放到 $THEOS/sdks/（来自 theos/sdks 仓库）
 
 cd RedditEnhancerTweak
-make clean && make FINALPACKAGE=1   # 产出 libRedditEnhancer.dylib
+make clean && make FINALPACKAGE=1   # 产出 RedditEnhancer.dylib
 ```
 
-产物：`libRedditEnhancer.dylib`（arm64，无 Substrate 依赖）。
+产物：`RedditEnhancer.dylib`（arm64，无 Substrate 依赖）。
 
 ---
 
@@ -91,7 +91,7 @@ make clean && make FINALPACKAGE=1   # 产出 libRedditEnhancer.dylib
 
 ### 方式 A：Azule（最省事）
 1. 打开 Azule → 选择 Reddit IPA；
-2. 在 "Dylibs / Tweaks" 里添加编译好的 `libRedditEnhancer.dylib`；
+2. 在 "Dylibs / Tweaks" 里添加编译好的 `RedditEnhancer.dylib`；
 3. 模式选 **TrollStore / Rootless**；
 4. 注入并导出新 IPA。
 
@@ -100,10 +100,10 @@ make clean && make FINALPACKAGE=1   # 产出 libRedditEnhancer.dylib
 ```bash
 unzip Reddit-2026.46.0.ipa -d work
 mkdir -p work/Payload/RedditApp.app/Frameworks
-cp libRedditEnhancer.dylib work/Payload/RedditApp.app/Frameworks/
+cp RedditEnhancer.dylib work/Payload/RedditApp.app/Frameworks/
 
 optool install -c load \
-  -p @executable_path/Frameworks/libRedditEnhancer.dylib \
+  -p @executable_path/Frameworks/RedditEnhancer.dylib \
   -t work/Payload/RedditApp.app/RedditApp
 
 cd work && zip -qr ../Reddit-Enhanced.ipa Payload
@@ -121,7 +121,7 @@ cd work && zip -qr ../Reddit-Enhanced.ipa Payload
 
 - **广告还在？** 确认开关 "Remove Ads / Promoted" 已打开；新版广告由 `adPayload` 注入，需刷新信息流（下拉）才会过滤新数据。
 - **悬浮按钮不出现？** 说明 dylib 未被加载：检查注入是否成功（`otool -L RedditApp | grep RedditEnhancer`），以及是否用了 TrollStore 安装。
-- **App 崩溃？** 多半是注入路径不对或 dylib 架构/签名问题：确认 arm64、ad-hoc 签名（`ldid -S libRedditEnhancer.dylib`）。
+- **App 崩溃？** 多半是注入路径不对或 dylib 架构/签名问题：确认 arm64、ad-hoc 签名（`ldid -S RedditEnhancer.dylib`）。
 - **开关无效？** 所有开关读取 `NSUserDefaults`，改完立即对后续请求生效，已缓存的旧内容需下拉刷新。
 
 ---

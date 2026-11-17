@@ -21,18 +21,23 @@ jobs:
       - name: Collect artifact
         run: |
           mkdir -p artifacts
-          DYLIB=$(find .theos -name 'libRedditEnhancer.dylib' -print -quit)
+          # library.mk names the output RedditEnhancer.dylib (no lib prefix).
+          # Prefer the fat/universal copy in .theos/obj over the arch-specific one.
+          DYLIB=$(find .theos/obj -maxdepth 1 -name 'RedditEnhancer.dylib' -print -quit)
           if [ -z "$DYLIB" ]; then
-            echo "::error::libRedditEnhancer.dylib not found"
+            DYLIB=$(find .theos -name 'RedditEnhancer.dylib' -print -quit)
+          fi
+          if [ -z "$DYLIB" ]; then
+            echo "::error::RedditEnhancer.dylib not found"
             find .theos -type f -print
             exit 1
           fi
           cp "$DYLIB" artifacts/
           echo "--- dylib info ---"
-          file "artifacts/libRedditEnhancer.dylib"
-          lipo -info "artifacts/libRedditEnhancer.dylib"
+          file "artifacts/RedditEnhancer.dylib"
+          lipo -info "artifacts/RedditEnhancer.dylib"
           echo "--- linked libraries (must NOT contain substrate/ellekit) ---"
-          otool -L "artifacts/libRedditEnhancer.dylib"
+          otool -L "artifacts/RedditEnhancer.dylib" || true
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4

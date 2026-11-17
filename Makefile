@@ -28,6 +28,6 @@ RedditEnhancer_CFLAGS     = -fobjc-arc -Wno-unknown-warning-option \
 
 # Where the dylib will live inside the injected app. Azule/optool
 # add the matching LC_LOAD_DYLIB entry to the RedditApp binary.
-RedditEnhancer_INSTALL_NAME = @executable_path/Frameworks/libRedditEnhancer.dylib
+RedditEnhancer_INSTALL_NAME = @executable_path/Frameworks/RedditEnhancer.dylib
 
 include $(THEOS_MAKE_PATH)/library.mk
