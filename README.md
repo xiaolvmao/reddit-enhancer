@@ -1,7 +1,7 @@
 # Reddit Enhancer — Reddit 2026.46.0 去广告 / 优化插件
 
 针对 `com.reddit.Reddit` **2026.46.0**（可执行文件 `RedditApp`，你提供的 IPA）的 TrollStore 注入 dylib 插件。
-**去广告默认开启**，设置以原生 iOS 开关（UISwitch）形式呈现，入口是一个可拖动悬浮按钮。
+**去广告默认开启**，设置以原生 iOS 开关（UISwitch）形式呈现，入口是设置页导航栏的「增强设置」。
 
 ---
 
@@ -17,7 +17,7 @@
 | 存在的 JSON 键 | `adPayload`、`AdPost`、`SubredditPost`、`CellGroup`、`recommendationContext`、`isScoreHidden`、`awardings`、`isGildable`、`isHidden`、`isNsfw`、`isInitiallyCollapsed`、`authorInfo` 全部**确认存在** | 过滤逻辑对 2026.46.0 有效 |
 | 已消失的旧键 | `commentsPageAds`、`commentTreeAds`、`pdpCommentsAds`、`isPromotedUserPostAd` 等 | 旧版 RedditFilter 的这部分 Hook 在新版**已失效**，本插件不再依赖它们 |
 | 网络层 | `NSURLSession -dataTaskWithRequest:completionHandler:` 签名存在；同时也用了 Swift `URLSession.data(for:delegate:)` 异步 API | 单 Hook 网络回调不够，**补了一层 JSON 解析 Hook** 双保险 |
-| 设置页 | 已是 **SwiftUI**（`RedditAppSettings_Internal` 模块，`AppSettingsRouterImpl` 等）；旧的 `AppSettingsViewController` / `UserDrawerViewController` **不存在** | 无法把入口插进原生设置页，改为**自包含悬浮入口 + 自绘设置面板**，不依赖 App 私有类，最稳 |
+| 设置页 | 已是 **SwiftUI**（`RedditAppSettings_Internal` 模块，`AppSettingsRouterImpl` 等）；旧的 `AppSettingsViewController` / `UserDrawerViewController` **不存在** | 不能往 SwiftUI 列表里塞行，改为 Hook `viewDidAppear:` 后往**导航栏**注入「增强设置」，打开自绘的二级菜单 |
 | 主题/ cell 类 | `ToggleImageTableViewCell`、`BaseTableReusableView`、`ImageLabelTableViewCell` 仍存在 | 但未使用，避免耦合 |
 
 > 结论：去广告和精简功能，**在网络 JSON 层做是唯一对 2026.46.0 稳定可靠的方案**。上层 SwiftUI 全是 mangled 符号，硬 Hook 会在下次更新即失效且极易崩溃。
@@ -28,7 +28,7 @@
 
 ## 二、功能 / 开关
 
-进入 App 的**设置页**（Settings）→ 右上角出现 **「增强设置」** 按钮 → 点开即为原生开关二级菜单，**全中文、全部即时生效**，无需重启 App。
+进入 App 的**设置页**（Settings）→ 导航栏右上角出现 **「增强设置」** → 点开即为原生开关二级菜单，**全中文、全部即时生效**，无需重启 App。
 
 **内容过滤**
 1. **去除广告与推广**（默认开）— 过滤推广帖、`AdPost`、`CellGroup.adPayload`、广告容器
@@ -37,26 +37,39 @@
 4. **隐藏赞赏徽章** — 隐藏帖子/评论的 Awards 徽章
 5. **隐藏投票数** — 隐藏票数（利用 `isScoreHidden`）
 
+**侧边栏（左侧抽屉）**
+6. **隐藏「Reddit 上的游戏」**（默认开）— 折叠抽屉里的 Devvit 游戏推荐分区
+7. **隐藏「资源」推广区**（默认开）— 折叠 Reddit Pro／Premium／广告合作等入口
+
 **界面精简**
-6. **隐藏侧边栏游戏位**（默认开）— 移除左侧菜单「Reddit 上的游戏」整块分区
-7. **隐藏侧边栏资源位**（默认开）— 移除左侧菜单「资源 / Reddit Pro / Premium」整块分区
 8. **折叠 AutoMod 评论** — 自动折叠 AutoMod 机器人的回复
 9. **隐藏 Premium 推广** — 移除 Premium 横幅、升级提示与 upsell cell
 
+**隐私与体验**
+10. **屏蔽广告与统计追踪**（默认开）— 拦截 `ads.reddit.com`／`ads-api.reddit.com`／`alb.reddit.com`／`pixel-config.reddit.com`／Appsflyer／Firebase／Braze／Sentry 等域名，请求不出网
+11. **屏蔽 App Store 评分弹窗**（默认开）— Hook `SKStoreReviewController requestReview`
+
 > **「折叠 AutoMod 评论」说明**：Subreddit 的 AutoMod 是自动管理机器人，常发置顶规则/说明。开启后，它发的评论在加载时默认是折叠状态（点一下仍可展开），让评论区优先显示真实用户的讨论。默认关闭。
 >
-> **侧边栏游戏位 / 资源位（v3 已重写）**：v2 只把折叠状态写进 UserDefaults，实测无效 —— 因为抽屉内容被 `CommunityDrawerCacheServiceImpl` 缓存成 ViewModel，改偏好不会重算。
-> v3 改为**在 UIKit 层接管抽屉表格**：识别到推广分区后向 `UITableViewDataSource` 返回 0 行、把 header 高度设为 0，**行被真正移除，不留空白**。
-> 识别信号三重冗余：cell/header 类名（`CommunityDrawerGamesOnRedditCell`、`GamesOnRedditFeaturedView` 等）+ `accessibilityIdentifier`（`redditCommunityDrawerResourcesSection`、`...FeaturedGameCell`、`...TryProTitle` 等）+ 视图树文案（“Games on Reddit”“Resources”“Advertise on Reddit”…）。三者命中任一即整段隐藏。
+> **侧边栏游戏位 / 资源位（v4 已重写）**：
+> - v2 只写 UserDefaults 折叠 key → 无效（抽屉内容被 `CommunityDrawerCacheServiceImpl` 缓存成 ViewModel）。
+> - v3 改成「返回 0 行」→ **闪退**。抽屉表格是 `_UIDiffableDataSource`，行数由快照决定；
+>   篡改 `numberOfRowsInSection` 会让行数和快照脱钩，UIKit 在批次更新时抛
+>   `NSInternalInconsistencyException（Invalid update）` 直接 abort（崩溃日志已证实）。
+> - v4 改为**只动高度**：把该分区的 `heightForRow` / `heightForHeader` 归零 + 隐藏 cell，
+>   再用 `beginUpdates/endUpdates` 触发高度重算。**不碰行数、不 reloadData**，因此不可能触发该崩溃。
+>   识别信号三重冗余：cell/header 类名 + `accessibilityIdentifier` + 视图树文案。
 >
-> **Premium 说明（重要）**：设置里的「获取 Premium」是 StoreKit 内购，会员状态由服务端下发（`RedditCore_Models.User.hasPremium` 是 Swift 结构体字段，二进制里没有任何可 swizzle 的 ObjC 账号模型）。**客户端无法真正解锁会员权益**，所以 v3 不再提供「解锁 Premium」这个假开关，只保留「隐藏 Premium 推广」。想真正去广告用第 1 项即可。
+> **Premium 说明（重要）**：设置里的「获取 Premium」是 StoreKit 内购，会员状态由服务端下发（`RedditCore_Models.User.hasPremium` 是 Swift 结构体字段，二进制里没有任何可 swizzle 的 ObjC 账号模型）。**客户端无法真正解锁会员权益**，插件只保留「隐藏 Premium 推广」。想真正去广告用第 1 项即可。
 
 > 入口实现：2026.46.0 的设置页是纯 SwiftUI，因此 Hook 系统 `UIViewController.viewDidAppear:`，
-> 检测到设置页时注入「增强设置」按钮。**v3 增加了兜底**：如果该页没有 `UINavigationController`
-> （SwiftUI sheet 常见），会在页面右上角放一个小号「增强」按钮，保证入口一定找得到。旧版悬浮按钮已移除。
+> 检测到设置页时在**导航栏**注入「增强设置」。v4 移除了 v3 那个角落小胶囊按钮：
+> 先找 `UINavigationController`，没有就退到 SwiftUI 自己的 `UINavigationBar`（`SwiftUI.UIKitNavigationBar`），
+> 找不到就延迟重试 3 次（SwiftUI 导航栏是渲染后才生成的）。**不再有任何悬浮/角落按钮。**
 >
-> **诊断页**：增强设置 → 其他 → 诊断信息。里面会显示 hook 安装数、抽屉表格接管数、被移除的分区数、
-> 网络命中次数、当前所有开关状态，以及实时日志。反馈问题时把这一页截图即可定位。
+> **诊断页**：增强设置 → 其他 → 诊断信息。会显示 hook 安装数、抽屉表格接管数、被折叠的分区数、
+> 拦截的追踪请求数、网络命中次数、全部开关状态与实时日志；日志里还会**留档抽屉里出现过的每个
+> cell 类名 / 无障碍标识 / 分区标题**，反馈时截图即可精确定位。
 
 其他优化（已内置、无需开关）：
 - Hook `NSURLSession` + `NSJSONSerialization` 双通道，覆盖同步回调与 Swift async/await 两条网络路径；
@@ -64,7 +77,8 @@
 - 递归深度上限 + 递归锁，避免死循环与重复过滤；
 - **不依赖 Substrate / ElleKit**（纯 `method_setImplementation` / `class_addMethod`），注入更简单、更少兼容问题；
 - 偏好同时写 App Group（`group.com.reddit.Reddit`）与 standard；读取时 Group 显式值优先；
-- 抽屉分区过滤带**安全阀**：分区行数 > 14 视为「整个抽屉」，只隐藏视图不整段清空。
+- 抽屉分区过滤带**安全阀**：分区行数 > 10 视为「整块抽屉列表」，放弃折叠，避免把整条侧边栏清空；
+- 所有会在布局期间/批次更新期间执行的 hook 都加了 `@try/@catch`，异常只记日志不崩溃。
 
 ---
 
