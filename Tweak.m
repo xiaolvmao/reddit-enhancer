@@ -35,6 +35,14 @@ static NSString *const kREHideAwards       = @"RE.hide.awards";
 static NSString *const kREHideScores       = @"RE.hide.scores";
 static NSString *const kRECollapseAutoMod  = @"RE.collapse.automod";
 static NSString *const kREHidePremium      = @"RE.hide.premium";
+static NSString *const kREHideDrawerGames  = @"RE.hide.drawer.games";     // 侧边栏游戏位
+static NSString *const kREHideDrawerResources = @"RE.hide.drawer.resources"; // 侧边栏资源位
+
+// Reddit 自带的侧边栏分区折叠状态 key（强制折叠 = 让这些推广分区收起）
+static NSString *const kRECollapsedGamesKey     = @"isGamesOnRedditCollapsed";
+static NSString *const kRECollapsedGamesKey2    = @"isGamesDrawerCollapsed";
+static NSString *const kRECollapsedResourcesKey = @"isResourcesCollapsed";
+static NSString *const kRECollapsedAboutKey     = @"isAboutCollapsed";
 
 static inline BOOL REBool(NSString *key, BOOL fallback) {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -42,10 +50,85 @@ static inline BOOL REBool(NSString *key, BOOL fallback) {
     return v ? [v boolValue] : fallback;
 }
 
+// 强制折叠侧边栏的「游戏 / 资源 / 关于」推广分区。
+// Reddit 用这些 key 记住分区展开状态；设为 YES 后对应分区默认收起。
+static void REApplyDrawerCollapse(void) {
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    if (REBool(kREHideDrawerGames, YES)) {
+        [d setBool:YES forKey:kRECollapsedGamesKey];
+        [d setBool:YES forKey:kRECollapsedGamesKey2];
+    }
+    if (REBool(kREHideDrawerResources, YES)) {
+        [d setBool:YES forKey:kRECollapsedResourcesKey];
+        [d setBool:YES forKey:kRECollapsedAboutKey];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // JSON 过滤 — 就地修改可变的 GraphQL 响应
 // 思路参考 level3tjg/RedditFilter (MIT)，针对 2026.46.0 实际结构重写
 // ---------------------------------------------------------------------------
+// 判断某个数组元素是否为「侧边栏游戏位 / 资源位」推广节点。
+// 只在对应开关开启时返回 YES，避免误伤正常的社区/帖子列表。
+static BOOL REIsDrawerPromoItem(id item) {
+    if (![item isKindOfClass:NSDictionary.class]) return NO;
+    NSDictionary *d = (NSDictionary *)item;
+
+    // 游戏位：专属 __typename（Devvit 小游戏）
+    if (REBool(kREHideDrawerGames, YES)) {
+        NSString *type = d[@"__typename"];
+        if ([type isKindOfClass:NSString.class]) {
+            if ([type isEqualToString:@"PersonalizedDevvitGame"] ||
+                [type isEqualToString:@"FeaturedDevvitGame"] ||
+                [type isEqualToString:@"GameCategoryTagSlice"]) return YES;
+        }
+        // 游戏位条目的独特特征键（monthlyPlayers 几乎只出现在 Devvit 游戏上）
+        if (d[@"monthlyPlayers"] || d[@"personalizedDevvitGame"] ||
+            d[@"featuredDevvitGame"]) return YES;
+    }
+
+    // 资源位：CommunityDrawerItems 里的推广条目。
+    // 只匹配高度独特的标识，避免误伤同名的普通社区/字段；
+    // 主要可靠性由 REApplyDrawerCollapse 的原生折叠状态保证。
+    if (REBool(kREHideDrawerResources, YES)) {
+        static NSSet *resMarkers = nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            resMarkers = [NSSet setWithArray:@[
+                @"advertiseonreddit", @"tryredditpro", @"osainformation",
+                @"osaformation", @"privacypolicy", @"useragreement",
+                @"acknowledgements", @"redditrules", @"discovergames"
+            ]];
+        });
+        // 检查 key 名
+        for (NSString *key in d.allKeys) {
+            if ([key isKindOfClass:NSString.class] &&
+                [resMarkers containsObject:key.lowercaseString]) {
+                id val = d[key];
+                if (val && ![val isKindOfClass:NSNull.class]) return YES;
+            }
+        }
+        // 检查 id / type / identifier 的「值」
+        for (NSString *kk in @[@"id", @"type", @"identifier", @"kind"]) {
+            id v = d[kk];
+            if ([v isKindOfClass:NSString.class] &&
+                [resMarkers containsObject:((NSString *)v).lowercaseString]) return YES;
+        }
+    }
+    return NO;
+}
+
+static void REPruneArray(NSMutableArray *arr) {
+    if (![arr isKindOfClass:NSMutableArray.class]) return;
+    // 倒序删除，避免索引错位
+    for (NSInteger i = arr.count - 1; i >= 0; i--) {
+        id item = arr[i];
+        if (REIsDrawerPromoItem(item)) {
+            [arr removeObjectAtIndex:i];
+        }
+    }
+}
+
 static void REFilterNode(NSMutableDictionary *node) {
     if (![node isKindOfClass:NSMutableDictionary.class]) return;
     id rawType = node[@"__typename"];
@@ -146,7 +229,9 @@ static void REFilterNode(NSMutableDictionary *node) {
 static void REWalkJSON(id obj, NSUInteger depth) {
     if (depth > 16) return;
     if ([obj isKindOfClass:NSMutableArray.class]) {
-        for (id item in (NSMutableArray *)obj) REWalkJSON(item, depth + 1);
+        NSMutableArray *arr = (NSMutableArray *)obj;
+        REPruneArray(arr);                       // 去掉侧边栏推广位节点
+        for (id item in arr) REWalkJSON(item, depth + 1);
     } else if ([obj isKindOfClass:NSArray.class]) {
         for (id item in (NSArray *)obj) REWalkJSON(item, depth + 1);
     } else if ([obj isKindOfClass:NSMutableDictionary.class]) {
@@ -259,11 +344,13 @@ static void REInstallJSONHook(void) {
 // ---------------------------------------------------------------------------
 static NSArray<NSString *> *RESettingKeys(void) {
     return @[kREFilterPromoted, kREFilterRecommended, kREFilterNSFW,
+             kREHideDrawerGames, kREHideDrawerResources,
              kREHideAwards, kREHideScores, kRECollapseAutoMod, kREHidePremium];
 }
 
 static NSArray<NSString *> *RESettingTitles(void) {
     return @[@"去除广告与推广", @"隐藏推荐内容", @"屏蔽 NSFW 内容",
+             @"隐藏侧边栏游戏位", @"隐藏侧边栏资源位",
              @"隐藏赞赏徽章", @"隐藏投票数", @"自动折叠 AutoMod", @"隐藏 Premium 推广"];
 }
 
@@ -271,19 +358,24 @@ static NSArray<NSString *> *RESettingSubtitles(void) {
     return @[@"移除推广帖、广告和赞助内容",
              @"去除「相似帖子」等推荐注入",
              @"从信息流中隐藏 NSFW 内容",
+             @"移除左侧菜单里的游戏推荐位",
+             @"移除左侧菜单里的资源与推广链接",
              @"移除帖子和评论的赞赏徽章",
              @"隐藏点赞／点踩数量",
              @"自动折叠 AutoMod 机器人的评论",
              @"移除 Reddit Premium 横幅和提示"];
 }
 
-static BOOL REDefaultForIndex(NSInteger i) { return (i == 0); }  // 仅去广告默认开
+static BOOL REDefaultForIndex(NSInteger i) {
+    // 去广告、去游戏位、去资源位默认开（用户要求）
+    return (i == 0 || i == 3 || i == 4);
+}
 
 // 两个分组：内容过滤 / 界面精简
 static NSInteger RESectionCount(void) { return 2; }
-static NSInteger RERowsInSection(NSInteger section) { return section == 0 ? 3 : 4; }
+static NSInteger RERowsInSection(NSInteger section) { return section == 0 ? 5 : 4; }
 static NSInteger REGlobalIndex(NSIndexPath *indexPath) {
-    return indexPath.section == 0 ? indexPath.row : 3 + indexPath.row;
+    return indexPath.section == 0 ? indexPath.row : 5 + indexPath.row;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,8 +473,14 @@ static void REInstallUIHook(void) {
 }
 
 - (void)re_toggle:(UISwitch *)sender {
-    [NSUserDefaults.standardUserDefaults setBool:sender.on forKey:RESettingKeys()[sender.tag]];
+    NSString *key = RESettingKeys()[sender.tag];
+    [NSUserDefaults.standardUserDefaults setBool:sender.on forKey:key];
     [NSUserDefaults.standardUserDefaults synchronize];
+    // 侧边栏开关变化时，立即同步折叠状态
+    if ([key isEqualToString:kREHideDrawerGames] ||
+        [key isEqualToString:kREHideDrawerResources]) {
+        REApplyDrawerCollapse();
+    }
 }
 
 @end
@@ -431,6 +529,7 @@ __attribute__((constructor)) static void REInitialize(void) {
         NSArray *keys = RESettingKeys();
         for (NSUInteger i = 0; i < keys.count; i++) defaults[keys[i]] = @(REDefaultForIndex(i));
         [NSUserDefaults.standardUserDefaults registerDefaults:defaults];
+        REApplyDrawerCollapse();
 
         REInstallNetworkHook();
         REInstallJSONHook();
