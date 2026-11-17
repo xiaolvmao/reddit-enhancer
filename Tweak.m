@@ -1098,7 +1098,6 @@ static NSArray<NSDictionary *> *REAllRows(void) {
     return rows;
 }
 
-static NSInteger RERowCount(void) { return (NSInteger)REAllRows().count; }
 static NSInteger RESectionCount(void) { return (NSInteger)RESettingsModel().count; }
 
 static NSDictionary *RESectionAt(NSInteger section) {
