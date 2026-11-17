@@ -278,6 +278,19 @@ static BOOL REScanTextInView(UIView *view, NSUInteger depth,
     return NO;
 }
 
+// SwiftUI 自绘的 cell 里没有 UILabel，文案挂在宿主视图的 accessibilityLabel 上，
+// 上面的 REScanTextInView 完全看不到 → 这类行会漏掉。再顺着标签扫一遍。
+// 只在抽屉 cell 上调用（数量很小），深度限制 6 层。
+static BOOL REScanA11yInView(UIView *view, NSUInteger depth) {
+    if (!view || depth > 6) return NO;
+    if (REStringIsPromo(view.accessibilityLabel)) return YES;
+    if (REStringIsPromo(view.accessibilityIdentifier)) return YES;
+    for (UIView *sub in view.subviews) {
+        if (REScanA11yInView(sub, depth + 1)) return YES;
+    }
+    return NO;
+}
+
 // 判断一个 cell / header 视图是否是抽屉推广位
 static BOOL REViewIsPromo(UIView *view) {
     if (!view) return NO;
@@ -294,9 +307,12 @@ static BOOL REViewIsPromo(UIView *view) {
     if (REStringIsPromo(ident)) return YES;
     if (REStringIsPromo(label)) return YES;
 
-    // 3) 视图树文案
+    // 3) 视图树文案（UIKit 自绘 cell）
     BOOL (^pred)(NSString *) = ^BOOL(NSString *s) { return REStringIsPromo(s); };
-    return REScanTextInView(view, 0, pred);
+    if (REScanTextInView(view, 0, pred)) return YES;
+
+    // 4) 视图树上的无障碍标签（SwiftUI 自绘 cell 的唯一出口）
+    return REScanA11yInView(view, 0);
 }
 
 // ---------------------------------------------------------------------------
