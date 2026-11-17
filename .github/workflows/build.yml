@@ -16,16 +16,15 @@ jobs:
         uses: waruhachi/theos-action@v2.6.5
 
       - name: Build dylib
-        working-directory: ./RedditEnhancerTweak
         run: make clean && make FINALPACKAGE=1
 
       - name: Collect artifact
         run: |
           mkdir -p artifacts
-          DYLIB=$(find RedditEnhancerTweak/.theos -name 'libRedditEnhancer.dylib' -print -quit)
+          DYLIB=$(find .theos -name 'libRedditEnhancer.dylib' -print -quit)
           if [ -z "$DYLIB" ]; then
             echo "::error::libRedditEnhancer.dylib not found"
-            find RedditEnhancerTweak/.theos -type f -print
+            find .theos -type f -print
             exit 1
           fi
           cp "$DYLIB" artifacts/
