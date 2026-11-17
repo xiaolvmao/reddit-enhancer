@@ -44,6 +44,8 @@
 **界面精简**
 8. **折叠 AutoMod 评论** — 自动折叠 AutoMod 机器人的回复
 9. **隐藏 Premium 推广** — 移除 Premium 横幅、升级提示与 upsell cell
+10. **隐藏趋势 / Trending**（默认开）— 去掉搜索页的 Trending 单元（`SearchTrendingFeedUnit`）与抽屉趋势分区
+11. **隐藏 Reddit Answers 入口**（默认开）— 去掉搜索栏「Ask Answers」按钮、Answers 预览卡与 AI 产品卡
 
 **隐私与体验**
 10. **屏蔽广告与统计追踪**（默认开）— 拦截 `ads.reddit.com`／`ads-api.reddit.com`／`alb.reddit.com`／`pixel-config.reddit.com`／Appsflyer／Firebase／Braze／Sentry 等域名，请求不出网
@@ -59,6 +61,18 @@
 > - v4 改为**只动高度**：把该分区的 `heightForRow` / `heightForHeader` 归零 + 隐藏 cell，
 >   再用 `beginUpdates/endUpdates` 触发高度重算。**不碰行数、不 reloadData**，因此不可能触发该崩溃。
 >   识别信号三重冗余：cell/header 类名 + `accessibilityIdentifier` + 视图树文案。
+>
+> **趋势 / Answers 是怎么去掉的（v4.2）**：这两块是 SwiftUI 页面，没有可 hook 的 UIKit 类，
+> 但 Reddit 会把 `UIIdentifier` 枚举的 rawValue 写进 `accessibilityIdentifier`。所以走两条路：
+> ① JSON 层：把 `SearchTrendingFeedUnit`、`SearchAnswersPreview*`、`AnswersProductCard/Hero`
+> 这些 `__typename` 打上 `isHidden`，或把 `trendingSearches` 之类的数组清空；
+> ② Hook `-[UIView setAccessibilityIdentifier:]`：一旦发现标识是 `...askAnswersButton`、
+> `...TrendingToday...`，直接 `hidden = YES`。这条 hook 只在 App 设置标识时触发，开销极低。
+>
+> **安装提示（重要）**：注入后必须重签**嵌套框架**，否则 dyld 会在启动阶段直接终止，报
+> `Library not loaded: @rpath/ExtensionDependencies.framework/...（code signature invalid）`。
+> 这跟插件无关（此时 dylib 还没被加载）。要么用会做深度签名的注入器，要么先
+> `codesign -f -s <证书> Payload/RedditApp.app/Frameworks/*.framework`，再签主 App。
 >
 > **Premium 说明（重要）**：设置里的「获取 Premium」是 StoreKit 内购，会员状态由服务端下发（`RedditCore_Models.User.hasPremium` 是 Swift 结构体字段，二进制里没有任何可 swizzle 的 ObjC 账号模型）。**客户端无法真正解锁会员权益**，插件只保留「隐藏 Premium 推广」。想真正去广告用第 1 项即可。
 
