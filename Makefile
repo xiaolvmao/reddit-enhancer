@@ -26,8 +26,11 @@ RedditEnhancer_CFLAGS     = -fobjc-arc -Wno-unknown-warning-option \
                             -Wno-unused-but-set-variable \
                             -Wno-unused-variable
 
-# Where the dylib will live inside the injected app. Azule/optool
-# add the matching LC_LOAD_DYLIB entry to the RedditApp binary.
-RedditEnhancer_INSTALL_NAME = @executable_path/Frameworks/RedditEnhancer.dylib
+# Where the dylib will live inside the injected app. Azule/optool add the
+# matching LC_LOAD_DYLIB entry to the RedditApp binary. For library.mk the
+# correct variable is *_INSTALL_PATH (it controls LC_ID_DYLIB); *_INSTALL_NAME
+# is silently ignored by this makefile.
+RedditEnhancer_INSTALL_PATH = @executable_path/Frameworks
+TWEAK_INSTALL_PATH = @executable_path/Frameworks
 
 include $(THEOS_MAKE_PATH)/library.mk
