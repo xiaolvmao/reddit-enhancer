@@ -2,6 +2,9 @@
 //  RedditEnhancer — TrollStore tweak for Reddit 2026.46.0
 //  Bundle ID: com.reddit.Reddit   Executable: RedditApp
 //
+//  v7.2 —— 删掉左上角的抽屉入口按钮；设置里去掉「只保留核心入口 / 隐藏游戏 /
+//        隐藏资源·关于」三个开关（抽屉已不显示，代码保留作兜底）。
+//
 //  v7 —— ① 可选「完全隐藏侧边栏」：在 presentViewController 层直接拒绝
 //        打开 CommunityDrawerViewController（默认开），抽屉根本不会出现，
 //        也就不会再去拉 CommunityDrawerItemsQuery（限流提示的来源之一）。
@@ -1221,6 +1224,120 @@ static void REInstallDrawerBlockHooks(void) {
                    (IMP)REHookPresentVC);
 }
 
+// ---------------------------------------------------------------------------
+// v7.2：删掉左上角的抽屉入口按钮
+// ---------------------------------------------------------------------------
+// 二进制里的相关事实：
+//   * UIIdentifier rawValue：`redditCommunityDrawerBarButton`（符号
+//     `...redditCommunityE15DrawerBarButtonACvau`）
+//   * 实现类：`CommunityDrawerBarButtonItem`（Swift，类名带 Drawer）/
+//     `UserAccountDrawerBarButtonItemImpl`（头像式入口，内部视图标识
+//     `userProfileAccountAvatarButton...`）
+//   * 对齐方式可变（`AccountDrawerButtonAlignment`），所以左右两侧都要过滤。
+// 两条路：① 拦 UINavigationItem 的四个 setter，创建时就丢掉；
+//        ② viewDidAppear 时再扫一遍导航栏（SwiftUI 复写导航栏时用得上）。
+static NSInteger gCntDrawerButtonsRemoved = 0;
+
+static BOOL REViewTreeHitsDrawerButton(UIView *view, NSUInteger depth) {
+    if (!view || depth > 4) return NO;
+    NSString *ident = view.accessibilityIdentifier.lowercaseString;
+    if (ident.length &&
+        ([ident containsString:@"drawerbar"] || [ident containsString:@"drawerbutton"] ||
+         [ident containsString:@"avatar"])) return YES;
+    for (UIView *sub in view.subviews) {
+        if (REViewTreeHitsDrawerButton(sub, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+static BOOL REBarItemIsDrawerEntry(UIBarButtonItem *item) {
+    if (!item) return NO;
+    if ([NSStringFromClass([item class]) containsString:@"Drawer"]) return YES;
+
+    NSString *ident = item.accessibilityIdentifier.lowercaseString;
+    if (ident.length && ([ident containsString:@"drawer"] || [ident containsString:@"avatar"])) {
+        return YES;
+    }
+    if ([item.title isKindOfClass:NSString.class] && item.title.length &&
+        [item.title.lowercaseString containsString:@"drawer"]) return YES;
+    if (item.customView && REViewTreeHitsDrawerButton(item.customView, 0)) return YES;
+    return NO;
+}
+
+static void REHookSetBarButtonItem(id self, SEL _cmd, UIBarButtonItem *item) {
+    UIBarButtonItem *next = item;
+    if (REBool(kREHideDrawerAll, YES) && REBarItemIsDrawerEntry(item)) {
+        gCntDrawerButtonsRemoved++;
+        RELogOnce(@"bar|drawer-item", @"移除抽屉入口按钮（%@）",
+                  NSStringFromClass([item class]) ?: @"UIBarButtonItem");
+        next = nil;
+    }
+    void (*orig)(id, SEL, UIBarButtonItem *) = (void *)REOriIMP(self, _cmd);
+    if (orig) orig(self, _cmd, next);
+}
+
+static void REHookSetBarButtonItems(id self, SEL _cmd, NSArray<UIBarButtonItem *> *items) {
+    NSArray<UIBarButtonItem *> *next = items;
+    if (REBool(kREHideDrawerAll, YES) && items.count) {
+        NSMutableArray *keep = [NSMutableArray arrayWithCapacity:items.count];
+        BOOL removed = NO;
+        for (UIBarButtonItem *bar in items) {
+            if (REBarItemIsDrawerEntry(bar)) {
+                removed = YES;
+                gCntDrawerButtonsRemoved++;
+                RELogOnce(@"bar|drawer-item", @"移除抽屉入口按钮（%@）",
+                          NSStringFromClass([bar class]) ?: @"UIBarButtonItem");
+                continue;
+            }
+            [keep addObject:bar];
+        }
+        if (removed) next = keep.count ? keep : nil;
+    }
+    void (*orig)(id, SEL, NSArray<UIBarButtonItem *> *) = (void *)REOriIMP(self, _cmd);
+    if (orig) orig(self, _cmd, next);
+}
+
+// 兜底：已经挂上去的入口按钮，进页面时再摘一遍（幂等）
+static void REStripDrawerButtons(UINavigationItem *item) {
+    if (!item || !REBool(kREHideDrawerAll, YES)) return;
+
+    for (int round = 0; round < 2; round++) {
+        NSArray<UIBarButtonItem *> *items = round == 0 ? item.leftBarButtonItems
+                                                       : item.rightBarButtonItems;
+        if (items.count == 0) continue;
+        NSMutableArray *keep = [NSMutableArray arrayWithCapacity:items.count];
+        BOOL removed = NO;
+        for (UIBarButtonItem *bar in items) {
+            if (REBarItemIsDrawerEntry(bar)) { removed = YES; continue; }
+            [keep addObject:bar];
+        }
+        if (!removed) continue;
+        if (round == 0) item.leftBarButtonItems = keep.count ? keep : nil;
+        else            item.rightBarButtonItems = keep.count ? keep : nil;
+    }
+}
+
+static void REStripDrawerButtonsFromBarsOf(UIViewController *vc) {
+    if (!vc) return;
+    REStripDrawerButtons(vc.navigationItem);
+    UINavigationController *nav = vc.navigationController;
+    if (!nav) return;
+    REStripDrawerButtons(nav.navigationItem);
+    if (nav.topViewController) REStripDrawerButtons(nav.topViewController.navigationItem);
+    for (UINavigationItem *item in nav.navigationBar.items) REStripDrawerButtons(item);
+}
+
+static void REInstallDrawerButtonHooks(void) {
+    RESwizzleClass([UINavigationItem class], @selector(setLeftBarButtonItem:),
+                   (IMP)REHookSetBarButtonItem);
+    RESwizzleClass([UINavigationItem class], @selector(setLeftBarButtonItems:),
+                   (IMP)REHookSetBarButtonItems);
+    RESwizzleClass([UINavigationItem class], @selector(setRightBarButtonItem:),
+                   (IMP)REHookSetBarButtonItem);
+    RESwizzleClass([UINavigationItem class], @selector(setRightBarButtonItems:),
+                   (IMP)REHookSetBarButtonItems);
+}
+
 // 浮层提示条（toast / snackbar）里的限流文案：只处理「直接挂在 UIWindow 上的
 // 那一层容器」，页面正文里的错误文字不碰。
 static void RESuppressRateLimitToast(UIView *label, NSString *text) {
@@ -1869,6 +1986,9 @@ static BOOL REIdentifierShouldHide(NSString *ident) {
         ([low containsString:@"trendingtoday"] ||
          [low containsString:@"screentrendingtopics"] ||
          [low containsString:@"drawertrendstitle"])) return YES;
+    // 抽屉入口按钮（redditCommunityDrawerBarButton）兜底：视图层直接藏
+    if (REBool(kREHideDrawerAll, YES) &&
+        ([low containsString:@"drawerbar"] || [low containsString:@"drawerbutton"])) return YES;
     return NO;
 }
 
@@ -1928,16 +2048,10 @@ static NSArray<NSDictionary *> *RESettingsModel(void) {
                ]},
 
             @{ @"t": @"侧边栏（左侧抽屉）",
-               @"f": @"打开左侧抽屉时生效；若没变化，去「其他 → 诊断信息」看命中数。",
+               @"f": @"开启后抽屉与左上角入口按钮一起消失；关掉即恢复原生行为。",
                @"rows": @[
-                    @{ @"k": kREHideDrawerAll,       @"t": @"完全隐藏侧边栏",
-                       @"s": @"抽屉不再弹出，也不会再拉取抽屉数据（限流提示主要来源）", @"d": @YES },
-                    @{ @"k": kREDrawerWhitelist,     @"t": @"只保留核心入口",
-                       @"s": @"只留热门、新闻、最新、创建社区、最近访问、你的社区，其余全部移除", @"d": @YES },
-                    @{ @"k": kREHideDrawerGames,     @"t": @"隐藏「Reddit 上的游戏」",
-                       @"s": @"折叠抽屉里的 Devvit 游戏推荐分区", @"d": @YES },
-                    @{ @"k": kREHideDrawerResources, @"t": @"隐藏「资源 / 关于」分区",
-                       @"s": @"去掉资源、Reddit Pro、Premium、关于、规则、隐私政策、用户协议", @"d": @YES },
+                    @{ @"k": kREHideDrawerAll, @"t": @"隐藏左侧抽屉和入口按钮",
+                       @"s": @"抽屉不再弹出、左上角按钮一并移除，也不再拉取抽屉数据", @"d": @YES },
                ]},
 
             @{ @"t": @"隐私与体验",
@@ -2017,6 +2131,7 @@ static NSString *REDiagnosticsText(void) {
     [text appendFormat:@"折叠抽屉分区: %ld\n", (long)gCntSectionsHidden];
     [text appendFormat:@"移除抽屉行: %ld\n", (long)gCntDrawerRowsHidden];
     [text appendFormat:@"拦截打开抽屉: %ld\n", (long)gCntDrawerBlocked];
+    [text appendFormat:@"移除抽屉入口按钮: %ld\n", (long)gCntDrawerButtonsRemoved];
     [text appendFormat:@"屏蔽限流提示: %ld\n", (long)gCntRateLimitSuppressed];
     [text appendFormat:@"白名单模式: %@\n", REBool(kREDrawerWhitelist, YES) ? @"开" : @"关"];
     [text appendFormat:@"按标识隐藏元素: %ld\n", (long)gCntViewsHidden];
@@ -2293,7 +2408,8 @@ static void REStripEntryFromBarsOf(UIViewController *vc) {
 
     RELog(@"开关 %@ = %@", row[@"t"], sender.on ? @"开" : @"关");
 
-    if ([key isEqualToString:kREHideDrawerGames] ||
+    if ([key isEqualToString:kREHideDrawerAll] ||
+        [key isEqualToString:kREHideDrawerGames] ||
         [key isEqualToString:kREHideDrawerResources] ||
         [key isEqualToString:kREDrawerWhitelist]) {
         REResetDrawerCache();
@@ -2494,6 +2610,9 @@ static void REHookedViewDidAppear(id self, SEL _cmd, BOOL animated) {
     // 自己的设置页 / 诊断页 / 承载它们的导航控制器：一律不处理
     if (REIsOwnVC(vc)) return;
 
+    // 左上角抽屉入口按钮：兜底再摘一遍（SwiftUI 复写导航栏时会重新挂上）
+    if (REBool(kREHideDrawerAll, YES)) REStripDrawerButtonsFromBarsOf(vc);
+
     // 完全隐藏侧边栏：抽屉万一还是出现了，直接藏 + 关掉，不再做任何行过滤
     if (REBool(kREHideDrawerAll, YES) && REIsCommunityDrawerVC(vc)) {
         REHideDrawerVC(vc);
@@ -2543,6 +2662,7 @@ __attribute__((constructor)) static void REInitialize(void) {
         REInstallReviewHook();
         REInstallA11yHook();
         REInstallDrawerBlockHooks();
+        REInstallDrawerButtonHooks();
         REInstallRateLimitHooks();
 
         RESwizzleClass([UIViewController class],

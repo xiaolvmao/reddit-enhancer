@@ -40,35 +40,45 @@
 5. **隐藏投票数** — 隐藏票数（利用 `isScoreHidden`）
 
 **侧边栏（左侧抽屉）**
-6. **完全隐藏侧边栏**（默认开，v7）— 抽屉**彻底不出现**：在
-   `-[UIViewController presentViewController:animated:completion:]` 里直接拒绝呈现
-   `CommunityDrawer*`，连数据都不再拉取。想恢复抽屉把这个开关关掉即可
-7. **只保留核心入口**（默认开，v6）— 抽屉只留 **热门 / 新闻 / 最新 / 创建社区 / 最近访问 / 你的社区**，
-   其余（发现社区、自定义信息流、收藏、关注、我管理的、版主、活动、游戏、资源、关于、规则、
-   隐私政策、用户协议…）全部移除
-8. **隐藏「Reddit 上的游戏」**（默认开）— 白名单模式关闭时的后备开关
-9. **隐藏「资源 / 关于」分区**（默认开）— 白名单模式关闭时的后备开关
+6. **隐藏左侧抽屉和入口按钮**（默认开，v7.2）— 抽屉**彻底不出现**，同时把**左上角的抽屉入口按钮**
+   一起删掉：① 在 `-[UIViewController presentViewController:animated:completion:]` 里直接拒绝呈现
+   `CommunityDrawer*`，连数据都不再拉取；② 拦 `UINavigationItem` 的 `leftBarButtonItem(s)` /
+   `rightBarButtonItem(s)` 四个 setter，把 `CommunityDrawerBarButtonItem` /
+   `UserAccountDrawerBarButtonItemImpl`（头像式入口）这类条目在挂上去的那一刻就丢掉，
+   再加 `viewDidAppear` 兜底扫一遍导航栏。想恢复原生抽屉把这个开关关掉即可
+   > v7.2 起从设置里**移除**了「只保留核心入口 / 隐藏 Reddit 上的游戏 / 隐藏资源·关于」三个开关
+   > （抽屉已经不显示了，它们没有意义）。对应代码仍保留：默认值就是「开」，
+   > 只是不再出现在界面上。
 
 **界面精简**
-8. **折叠 AutoMod 评论** — 自动折叠 AutoMod 机器人的回复
-9. **隐藏 Premium 推广** — 移除 Premium 横幅、升级提示与 upsell cell
-10. **隐藏趋势 / Trending**（默认开）— 去掉搜索页的 Trending 单元（`SearchTrendingFeedUnit`）与抽屉趋势分区
-11. **隐藏 Reddit Answers 入口**（默认开）— 去掉搜索栏「Ask Answers」按钮、Answers 预览卡与 AI 产品卡
+7. **折叠 AutoMod 评论** — 自动折叠 AutoMod 机器人的回复
+8. **隐藏 Premium 推广** — 移除 Premium 横幅、升级提示与 upsell cell
+9. **隐藏趋势 / Trending**（默认开）— 去掉搜索页的 Trending 单元（`SearchTrendingFeedUnit`）与抽屉趋势分区
+10. **隐藏 Reddit Answers 入口**（默认开）— 去掉搜索栏「Ask Answers」按钮、Answers 预览卡与 AI 产品卡
 
 **隐私与体验**
-10. **屏蔽广告与统计追踪**（默认开）— 拦截 `ads.reddit.com`／`ads-api.reddit.com`／`alb.reddit.com`／`pixel-config.reddit.com`／Appsflyer／Firebase／Braze／Sentry 等域名，请求不出网
-11. **屏蔽 App Store 评分弹窗**（默认开）— Hook `SKStoreReviewController requestReview`
-12. **屏蔽「速率限制」提示**（默认开，v7）— 拦 `UIAlertController` 与挂在窗口上的浮层提示条，
+11. **屏蔽广告与统计追踪**（默认开）— 拦截 `ads.reddit.com`／`ads-api.reddit.com`／`alb.reddit.com`／`pixel-config.reddit.com`／Appsflyer／Firebase／Braze／Sentry 等域名，请求不出网
+12. **屏蔽 App Store 评分弹窗**（默认开）— Hook `SKStoreReviewController requestReview`
+13. **屏蔽「速率限制」提示**（默认开，v7）— 拦 `UIAlertController` 与挂在窗口上的浮层提示条，
     文案命中 `速率限制 / 请求过于频繁 / rate limit / too many requests` 才动手，普通报错不受影响
 
-> **「速率限制」提示说明（重要）**：这是**服务器**对同一动作做频率限制后的报错
-> （`spamRateLimitMessage` / `rateLimitBanner` / `CommunityDrawerTableViewFailedCell` 都出自服务端响应）。
-> 插件只能把提示藏起来，**不能解除限制本身** —— 被限流时发帖/评论/投票依旧会失败，
-> 只是不再被打断。想减少触发频率，主要是别在短时间内连续做同类操作。
+> **速率限制到底能不能「解决」？**
+>
+> 分两种情况：
+>
+> 1. **抽屉/列表拉取触发的**（`CommunityDrawerTableViewFailedCell`、`CommunityDrawerItemsQuery`）——
+>    v7 起抽屉根本不打开，这类请求不再发出，**已经从根上消失**。
+> 2. **发帖 / 评论 / 投票 / 私信触发的**（`spamRateLimitMessage`、`rateLimitBanner`、`rateLimitExceeded`）——
+>    这是**服务端按账号 + IP + karma + 子版规则**算出来的，客户端**无法解除**。任何「破解限流」
+>    的做法最多是伪造成功提示，实际请求照样被拒，还可能加重风控。
+>
+> 插件能做的是三件事：① 不再发起无谓请求（已拦截追踪/广告域名）；② 不被提示打断（第 13 项）；
+> ③ 把抽屉这个高频触发点整个关掉。真要降低触发概率，只能：别在短时间内连发同类操作、
+> 新账号先积累 karma、避免使用被大量共享的代理 IP。
 
 > **「折叠 AutoMod 评论」说明**：Subreddit 的 AutoMod 是自动管理机器人，常发置顶规则/说明。开启后，它发的评论在加载时默认是折叠状态（点一下仍可展开），让评论区优先显示真实用户的讨论。默认关闭。
 >
-> **侧边栏白名单（v6，当前默认方式）**：
+> **侧边栏白名单（v6 实现；v7.2 起抽屉默认不打开，仅作兜底，设置里已不再暴露）**：
 > 抽屉表里的每一行都带 `accessibilityIdentifier`（`UIIdentifier` 枚举的 rawValue），
 > 二进制里能读到确切名字，所以按**白名单**判定比黑名单干净得多：
 >
@@ -110,6 +120,16 @@
 > （连调暗遮罩）设成 `hidden` + `userInteractionEnabled = NO`，再 `dismissViewControllerAnimated:NO`。
 > hidden 的视图不参与 hitTest，所以即使 dismiss 没成功，也不会出现「看不见的模态层吃掉所有点击」。
 >
+> **左上角抽屉按钮是怎么删的（v7.2）**：二进制里入口按钮有两套实现 ——
+> `CommunityDrawerBarButtonItem`（汉堡键，UIIdentifier `redditCommunityDrawerBarButton`）和
+> `UserAccountDrawerBarButtonItemImpl`（头像入口，内部视图标识 `userProfileAccountAvatarButton…`），
+> 对齐方式由 `AccountDrawerButtonAlignment` 决定（可能左也可能右）。所以：
+> ① swizzle `UINavigationItem` 的 `setLeftBarButtonItem(s):` / `setRightBarButtonItem(s):`，
+> 命中「类名含 Drawer / 标识含 drawer·avatar / customView 子树带同样标识」的条目直接丢掉；
+> ② `viewDidAppear` 再把导航栏扫一遍（SwiftUI 复写导航栏时会把按钮重新挂上）；
+> ③ 最后一道：`setAccessibilityIdentifier:` 里命中 `drawerbar` / `drawerbutton` 的视图直接 `hidden = YES`。
+> 想恢复按钮：关掉「隐藏左侧抽屉和入口按钮」。
+>
 > **趋势 / Answers 是怎么去掉的（v4.2）**：这两块是 SwiftUI 页面，没有可 hook 的 UIKit 类，
 > 但 Reddit 会把 `UIIdentifier` 枚举的 rawValue 写进 `accessibilityIdentifier`。所以走两条路：
 > ① JSON 层：把 `SearchTrendingFeedUnit`、`SearchAnswersPreview*`、`AnswersProductCard/Hero`
@@ -137,7 +157,7 @@
 > ④ 进页面时主动把导航栏里带「增强」字样的按钮摘掉（幂等兜底）。
 >
 > **诊断页**：增强设置 → 其他 → 诊断信息。会显示 hook 安装数、抽屉表格接管数、被折叠的分区数、
-> 拦截打开抽屉次数、屏蔽限流提示次数、拦截的追踪请求数、网络命中次数、全部开关状态与实时日志；日志里还会**留档抽屉里出现过的每个
+> 拦截打开抽屉次数、移除抽屉入口按钮数、屏蔽限流提示次数、拦截的追踪请求数、网络命中次数、全部开关状态与实时日志；日志里还会**留档抽屉里出现过的每个
 > cell 类名 / 无障碍标识 / 分区标题**，反馈时截图即可精确定位。
 
 其他优化（已内置、无需开关）：
