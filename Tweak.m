@@ -37,12 +37,30 @@ static NSString *const kRECollapseAutoMod  = @"RE.collapse.automod";
 static NSString *const kREHidePremium      = @"RE.hide.premium";
 static NSString *const kREHideDrawerGames  = @"RE.hide.drawer.games";     // 侧边栏游戏位
 static NSString *const kREHideDrawerResources = @"RE.hide.drawer.resources"; // 侧边栏资源位
+static NSString *const kREUnlockPremium    = @"RE.unlock.premium";        // 解锁 Premium 权益
 
 // Reddit 自带的侧边栏分区折叠状态 key（强制折叠 = 让这些推广分区收起）
 static NSString *const kRECollapsedGamesKey     = @"isGamesOnRedditCollapsed";
 static NSString *const kRECollapsedGamesKey2    = @"isGamesDrawerCollapsed";
 static NSString *const kRECollapsedResourcesKey = @"isResourcesCollapsed";
 static NSString *const kRECollapsedAboutKey     = @"isAboutCollapsed";
+
+// Reddit 用 App Group suite 存偏好（二进制里有 V_appGroupDefaults）。
+// 写进 suite 才会被 App 真正读到；standard 作为兜底。
+static NSUserDefaults *REAppDefaults(void) {
+    static NSUserDefaults *prefs = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        prefs = [[NSUserDefaults alloc] initWithSuiteName:@"group.com.reddit.Reddit"];
+        if (!prefs) prefs = NSUserDefaults.standardUserDefaults;
+    });
+    return prefs;
+}
+
+static void REsetPrefBool(NSString *key, BOOL value) {
+    [REAppDefaults() setBool:value forKey:key];
+    [NSUserDefaults.standardUserDefaults setBool:value forKey:key];
+}
 
 static inline BOOL REBool(NSString *key, BOOL fallback) {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
@@ -52,16 +70,51 @@ static inline BOOL REBool(NSString *key, BOOL fallback) {
 
 // 强制折叠侧边栏的「游戏 / 资源 / 关于」推广分区。
 // Reddit 用这些 key 记住分区展开状态；设为 YES 后对应分区默认收起。
-static void REApplyDrawerCollapse(void) {
-    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+// 递归遍历视图树，找到抽屉的 tableView（cell 类名含 CommunityDrawer）并 reload，
+// 让刚写入的折叠状态立即反映到已构建的抽屉上。
+static void REReloadDrawerViews(UIView *view, NSUInteger depth) {
+    if (!view || depth > 12) return;
+    if ([view isKindOfClass:UITableView.class]) {
+        NSString *cls = NSStringFromClass([view class]);
+        // 抽屉 tableView 由 CommunityDrawer 的 VC 持有
+        id next = view.nextResponder;
+        BOOL isDrawer = NO;
+        for (NSUInteger i = 0; i < 8 && next; i++, next = [next nextResponder]) {
+            NSString *n = NSStringFromClass([next class]);
+            if ([n containsString:@"CommunityDrawer"]) { isDrawer = YES; break; }
+        }
+        if (isDrawer || [cls containsString:@"CommunityDrawer"]) {
+            [((UITableView *)view) reloadData];
+        }
+    }
+    for (UIView *sub in view.subviews) REReloadDrawerViews(sub, depth + 1);
+}
+
+// 只把折叠状态写入 Reddit 读取的偏好（App Group suite + standard）。
+static void REWriteDrawerCollapseKeys(void) {
     if (REBool(kREHideDrawerGames, YES)) {
-        [d setBool:YES forKey:kRECollapsedGamesKey];
-        [d setBool:YES forKey:kRECollapsedGamesKey2];
+        REsetPrefBool(kRECollapsedGamesKey, YES);
+        REsetPrefBool(kRECollapsedGamesKey2, YES);
     }
     if (REBool(kREHideDrawerResources, YES)) {
-        [d setBool:YES forKey:kRECollapsedResourcesKey];
-        [d setBool:YES forKey:kRECollapsedAboutKey];
+        REsetPrefBool(kRECollapsedResourcesKey, YES);
+        REsetPrefBool(kRECollapsedAboutKey, YES);
     }
+}
+
+static void REApplyDrawerCollapse(void) {
+    REWriteDrawerCollapseKeys();
+
+    // 折叠状态写在启动早期，抽屉此刻可能已构建好 section；
+    // reload 后才会应用新的折叠值。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIApplication *app = UIApplication.sharedApplication;
+        for (UIScene *scene in app.connectedScenes) {
+            if (![scene isKindOfClass:UIWindowScene.class]) continue;
+            for (UIWindow *w in ((UIWindowScene *)scene).windows)
+                REReloadDrawerViews(w.rootViewController.view, 0);
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -129,10 +182,52 @@ static void REPruneArray(NSMutableArray *arr) {
     }
 }
 
+// 把当前登录用户（以及任何用户对象）标记为 Premium。
+// Reddit 的用户模型字段：isPremium / hasPremium / premiumStatus / isPremiumUser。
+// premiumStatus 的可接受值里 "premium"（详见二进制 premiumStatus 枚举）。
+// 只改内存中的 JSON，不改服务器账号，属于客户端展示层解锁。
+static void REUnlockPremiumInNode(NSMutableDictionary *node) {
+    if (!REBool(kREUnlockPremium, NO)) return;
+    NSString *type = [node[@"__typename"] isKindOfClass:NSString.class] ? node[@"__typename"] : nil;
+    id premium = node[@"isPremium"];
+    id pstatus = node[@"premiumStatus"];
+    id username = node[@"username"];
+    id name = node[@"name"];
+
+    // 判定是不是「用户对象」：有 isPremium/premiumStatus 键，
+    // 或 __typename 是用户类且有用户名。
+    BOOL isUser = (premium != nil || pstatus != nil) ||
+                  ((([type isEqualToString:@"Account"] ||
+                     [type isEqualToString:@"Redditor"] ||
+                     [type isEqualToString:@"User"])) &&
+                   (username || name));
+    if (!isUser) return;
+
+    node[@"isPremium"] = @YES;
+    node[@"hasPremium"] = @YES;
+    node[@"isPremiumUser"] = @YES;
+    node[@"isPremiumSubscriber"] = @YES;
+    node[@"hasPremiumSubscription"] = @YES;
+    node[@"isPremiumPurchased"] = @YES;
+    node[@"isGold"] = @YES;
+    // premiumStatus 是整数枚举（二进制 Tq 编码），1 = premium。
+    // 若原本是字符串枚举则保留字符串形式，避免类型不匹配。
+    if ([pstatus isKindOfClass:NSNumber.class]) {
+        node[@"premiumStatus"] = @1;
+    } else if ([pstatus isKindOfClass:NSString.class]) {
+        node[@"premiumStatus"] = @"premium";
+    } else {
+        node[@"premiumStatus"] = @1;
+    }
+    node[@"isEmployee"] = node[@"isEmployee"] ?: @NO;  // 不动员工标记
+}
+
 static void REFilterNode(NSMutableDictionary *node) {
     if (![node isKindOfClass:NSMutableDictionary.class]) return;
     id rawType = node[@"__typename"];
     NSString *type = [rawType isKindOfClass:NSString.class] ? rawType : nil;
+
+    REUnlockPremiumInNode(node);   // Premium 权益解锁
 
     // 普通帖子
     if ([type isEqualToString:@"SubredditPost"] || [type hasSuffix:@"Post"]) {
@@ -305,7 +400,9 @@ static id REHookedJSONObject(id self, SEL _cmd, NSData *data,
         NSArray<NSData *> *markers = @[
             [@"__typename" dataUsingEncoding:NSUTF8StringEncoding],
             [@"adPayload"  dataUsingEncoding:NSUTF8StringEncoding],
-            [@"CellGroup"  dataUsingEncoding:NSUTF8StringEncoding]
+            [@"CellGroup"  dataUsingEncoding:NSUTF8StringEncoding],
+            [@"premiumStatus" dataUsingEncoding:NSUTF8StringEncoding],
+            [@"isPremium" dataUsingEncoding:NSUTF8StringEncoding]
         ];
         for (NSData *marker in markers)
             if ([data rangeOfData:marker options:0 range:NSMakeRange(0, data.length)].location != NSNotFound) {
@@ -345,13 +442,15 @@ static void REInstallJSONHook(void) {
 static NSArray<NSString *> *RESettingKeys(void) {
     return @[kREFilterPromoted, kREFilterRecommended, kREFilterNSFW,
              kREHideDrawerGames, kREHideDrawerResources,
-             kREHideAwards, kREHideScores, kRECollapseAutoMod, kREHidePremium];
+             kREHideAwards, kREHideScores, kRECollapseAutoMod, kREHidePremium,
+             kREUnlockPremium];
 }
 
 static NSArray<NSString *> *RESettingTitles(void) {
     return @[@"去除广告与推广", @"隐藏推荐内容", @"屏蔽 NSFW 内容",
              @"隐藏侧边栏游戏位", @"隐藏侧边栏资源位",
-             @"隐藏赞赏徽章", @"隐藏投票数", @"自动折叠 AutoMod", @"隐藏 Premium 推广"];
+             @"隐藏赞赏徽章", @"隐藏投票数", @"自动折叠 AutoMod", @"隐藏 Premium 推广",
+             @"解锁 Premium 权益"];
 }
 
 static NSArray<NSString *> *RESettingSubtitles(void) {
@@ -363,17 +462,18 @@ static NSArray<NSString *> *RESettingSubtitles(void) {
              @"移除帖子和评论的赞赏徽章",
              @"隐藏点赞／点踩数量",
              @"自动折叠 AutoMod 机器人的评论",
-             @"移除 Reddit Premium 横幅和提示"];
+             @"移除 Reddit Premium 横幅和提示",
+             @"客户端标记账号为会员（不改服务器账号）"];
 }
 
 static BOOL REDefaultForIndex(NSInteger i) {
-    // 去广告、去游戏位、去资源位默认开（用户要求）
-    return (i == 0 || i == 3 || i == 4);
+    // 去广告、去游戏位、去资源位、解锁 Premium 默认开
+    return (i == 0 || i == 3 || i == 4 || i == 9);
 }
 
-// 两个分组：内容过滤 / 界面精简
+// 两个分组：内容过滤 / 界面精简（各 5 项）
 static NSInteger RESectionCount(void) { return 2; }
-static NSInteger RERowsInSection(NSInteger section) { return section == 0 ? 5 : 4; }
+static NSInteger RERowsInSection(NSInteger section) { return 5; }
 static NSInteger REGlobalIndex(NSIndexPath *indexPath) {
     return indexPath.section == 0 ? indexPath.row : 5 + indexPath.row;
 }
@@ -399,6 +499,13 @@ static void REHookedViewDidAppear(id self, SEL _cmd, BOOL animated) {
     UIViewController *vc = (UIViewController *)self;
     if (![vc isKindOfClass:UIViewController.class]) return;
     if ([vc isKindOfClass:[RESettingsViewController class]]) return;  // 排除我们自己的页面
+
+    // 抽屉菜单出现时，重写折叠状态（此时 section 尚未/刚构建，能读到最新值）
+    NSString *vcCls = NSStringFromClass([vc class]);
+    if ([vcCls containsString:@"CommunityDrawer"]) {
+        REWriteDrawerCollapseKeys();
+    }
+
     if (!vc.navigationController) return;                 // 只在有导航栏的页面注入
     if (objc_getAssociatedObject(vc, &kREEntryAssociatedKey)) return;  // 已注入
 
