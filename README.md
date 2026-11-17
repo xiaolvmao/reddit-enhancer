@@ -40,9 +40,11 @@
 5. **隐藏投票数** — 隐藏票数（利用 `isScoreHidden`）
 
 **侧边栏（左侧抽屉）**
-6. **隐藏「Reddit 上的游戏」**（默认开）— 折叠抽屉里的 Devvit 游戏推荐分区
-7. **隐藏「资源 / 关于」分区**（默认开）— 折叠资源、Reddit Pro、Premium、广告合作，
-   以及「关于 / 规则 / 隐私政策 / 用户协议 / 服务条款 / 辅助功能 / 帮助中心」整段
+6. **只保留核心入口**（默认开，v6）— 抽屉只留 **热门 / 新闻 / 最新 / 创建社区 / 最近访问 / 你的社区**，
+   其余（发现社区、自定义信息流、收藏、关注、我管理的、版主、活动、游戏、资源、关于、规则、
+   隐私政策、用户协议…）全部移除
+7. **隐藏「Reddit 上的游戏」**（默认开）— 白名单模式关闭时的后备开关
+8. **隐藏「资源 / 关于」分区**（默认开）— 白名单模式关闭时的后备开关
 
 **界面精简**
 8. **折叠 AutoMod 评论** — 自动折叠 AutoMod 机器人的回复
@@ -56,27 +58,37 @@
 
 > **「折叠 AutoMod 评论」说明**：Subreddit 的 AutoMod 是自动管理机器人，常发置顶规则/说明。开启后，它发的评论在加载时默认是折叠状态（点一下仍可展开），让评论区优先显示真实用户的讨论。默认关闭。
 >
-> **侧边栏游戏位 / 资源位（v4 已重写）**：
+> **侧边栏白名单（v6，当前默认方式）**：
+> 抽屉表里的每一行都带 `accessibilityIdentifier`（`UIIdentifier` 枚举的 rawValue），
+> 二进制里能读到确切名字，所以按**白名单**判定比黑名单干净得多：
+>
+> | 保留 | 标识 |
+> |---|---|
+> | 热门 | `…E17DrawerPopularItem` |
+> | 新闻 | `…E14DrawerNewsItem` |
+> | 最新 | `…E16DrawerLatestItem` |
+> | 创建社区 | `…e12DrawerCreateE4Item` |
+> | 最近访问 | `…E25DrawerRecentlyVisitedItem`（分区 `…E28DrawerRecentlyVisitedSection`） |
+> | 你的社区 | `…E29DrawerSubscribedSubredditItem`（分区 `…E28DrawerYourCommunitiesSection`） |
+>
+> **判定规则**：标识里同时含 `drawer` 与 `item`/`cell` 的，就是抽屉里的一行 ——
+> 只有命中上表的才留，其余一律移除（高度归零 = 真正移除，**不留空白**，也不碰行数）。
+> 分区标题不在保留列表的（`关于`/`资源`/`规则`/`发现`/`收藏`/`关注`/`我管理的`/`活动`/`趋势`…）
+> 整段折叠，header / 行 / footer 三个高度同时归零。
+> 拿不到标识的行按文案兜底，两边都不认识就**保留**（宁可留一条，也不误删）。
+>
+> **两个防误删机制**：① 只有「真标题」（`titleForHeaderInSection`）才做白名单判断，
+> 分区头视图里的文字只按明确的垃圾词判定 —— 头视图第一段文字可能是用户名或按钮文案；
+> ② 如果某个被折掉的分区里出现了**明确识别**为六个入口之一的行，立刻解折（自愈），
+> 不会因为标题判断失误把「你的社区」整段吞掉。
+>
+> **侧边栏历史（v2–v5.2）**：
 > - v2 只写 UserDefaults 折叠 key → 无效（抽屉内容被 `CommunityDrawerCacheServiceImpl` 缓存成 ViewModel）。
 > - v3 改成「返回 0 行」→ **闪退**。抽屉表格是 `_UIDiffableDataSource`，行数由快照决定；
 >   篡改 `numberOfRowsInSection` 会让行数和快照脱钩，UIKit 在批次更新时抛
 >   `NSInternalInconsistencyException（Invalid update）` 直接 abort（崩溃日志已证实）。
-> - v4 改为**只动高度**：把该分区的 `heightForRow` / `heightForHeader` 归零 + 隐藏 cell，
->   再用 `beginUpdates/endUpdates` 触发高度重算。**不碰行数、不 reloadData**，因此不可能触发该崩溃。
->   识别信号四重冗余：cell/header 类名 + `accessibilityIdentifier` + 视图树文案 +
->   子视图 `accessibilityLabel`（SwiftUI 自绘行没有 UILabel，文字只在 a11y 标签上，v5 补上）。
->   v5 还改成：**推广 cell 自身无条件隐藏**，即使安全阀拦下了整段折叠也不会漏出那一条。
->
-> **v5.2 修「抽屉一大块空白 + 影响其它功能」**：两个独立原因。
-> ① 旧版对「关于 / 规则 / 隐私 / 协议」是**逐行隐藏 cell**，行高仍然占着
->   （分区行数 >10 时安全阀拒绝整段折叠）→ 一连串空行拼成一大块空白。
->   现在这类内容一律走**整段折叠**（标题整串匹配 `关于`/`about`/`隐私政策`/`用户协议`…，
->   命中即 `heightForHeader`/`heightForRow`/`heightForFooter` 全归零），
->   只有真广告 cell 才逐行隐藏；安全阀也从「>10 行直接拒绝」改成「>14 行且命中 <3 次才拒绝」。
-> ② 旧版把「已折叠分区下标」按 dataSource 类名缓存给下一次抽屉实例复用，
->   而抽屉分区数量会随登录态 / 游戏服务 / A/B 实验变化 → **下标错位会折掉正常分区**。
->   现在缓存已删除，只按当前表格实时探测；分区数一变就清空重算
->   （`REValidateHiddenSet`）。
+> - v4 改为**只动高度**，不再碰行数、不 reloadData。v6 沿用这个安全边界。
+> - v5.2 修掉「逐行隐藏留空白」和「分区下标跨实例缓存导致错折正常分区」。
 >
 > **趋势 / Answers 是怎么去掉的（v4.2）**：这两块是 SwiftUI 页面，没有可 hook 的 UIKit 类，
 > 但 Reddit 会把 `UIIdentifier` 枚举的 rawValue 写进 `accessibilityIdentifier`。所以走两条路：
@@ -114,7 +126,9 @@
 - 递归深度上限 + 递归锁，避免死循环与重复过滤；
 - **不依赖 Substrate / ElleKit**（纯 `method_setImplementation` / `class_addMethod`），注入更简单、更少兼容问题；
 - 偏好同时写 App Group（`group.com.reddit.Reddit`）与 standard；读取时 Group 显式值优先；
-- 抽屉分区过滤带**安全阀**：分区行数 > 10 视为「整块抽屉列表」，放弃折叠，避免把整条侧边栏清空；
+- 抽屉分区过滤带**安全阀**（仅黑名单模式）：分区行数 > 14 且命中 <3 次时放弃折叠，避免误把整条侧边栏清空；
+  白名单模式不做该限制（那是明确要删的），但能用「明确保留行 → 解折」自愈；
+- 行列状态按 tableView 存，结构指纹（分区数 + 总行数）一变立刻清空，**不跨实例复用下标**；
 - 所有会在布局期间/批次更新期间执行的 hook 都加了 `@try/@catch`，异常只记日志不崩溃。
 
 ---
