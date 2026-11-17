@@ -57,6 +57,8 @@ static NSString *const kREHideDrawerGames     = @"RE.hide.drawer.games";
 static NSString *const kREHideDrawerResources = @"RE.hide.drawer.resources";
 static NSString *const kREBlockTrackers       = @"RE.block.trackers";
 static NSString *const kREBlockReviewPrompt   = @"RE.block.reviewprompt";
+static NSString *const kREHideTrending        = @"RE.hide.trending";
+static NSString *const kREHideAnswers         = @"RE.hide.answers";
 
 // Reddit 自己的抽屉折叠 key（写入作为次要手段）
 static NSString *const kRECollapsedGamesKey     = @"isGamesOnRedditCollapsed";
@@ -106,7 +108,7 @@ static NSObject *gRELogLock = nil;
 static NSDateFormatter *gREDateFmt = nil;
 static NSInteger gCntURLSession = 0, gCntJSON = 0, gCntNodes = 0;
 static NSInteger gCntAdStripped = 0, gCntDrawerTables = 0, gCntSectionsHidden = 0;
-static NSInteger gCntTrackersBlocked = 0, gCntReviewBlocked = 0;
+static NSInteger gCntTrackersBlocked = 0, gCntReviewBlocked = 0, gCntViewsHidden = 0;
 static NSInteger gCntHooksInstalled = 0;
 
 static void RELog(NSString *fmt, ...) {
@@ -177,12 +179,23 @@ static NSArray<NSString *> *REResourceMarkers(void) {
              @"advertiseon", @"advertise on reddit",
              @"trypro", @"try pro", @"tryredditpro", @"reddit pro",
              @"premiumtitle", @"reddit premium",
-             @"prolinks", @"earntitle", @"vaulttitle", @"trendstitle",
+             @"prolinks", @"earntitle", @"vaulttitle",
              @"rulestitle", @"reddit rules",
              @"privacypolicy", @"privacy policy",
              @"useragreement", @"user agreement",
              @"osainformation", @"osa information",
              @"acknowledgements", @"impressum", @"help center"];
+}
+
+// 抽屉里「趋势 / Trending」相关（独立的开关）
+static NSArray<NSString *> *RETrendingMarkers(void) {
+    return @[@"trendstitle", @"trending", @"trends", @"趋势"];
+}
+
+// 搜索栏 / 卡片里的 Reddit Answers（AI 入口）
+static NSArray<NSString *> *REAnswersMarkerList(void) {
+    return @[@"askanswers", @"answersproductcard", @"answershero",
+             @"answerspreview", @"answersdiscoveryunit"];
 }
 
 static BOOL REStringIsGamePromo(NSString *s) {
@@ -193,8 +206,17 @@ static BOOL REStringIsResourcePromo(NSString *s) {
     return REBool(kREHideDrawerResources, YES) && REMatchesAny(s, REResourceMarkers());
 }
 
+static BOOL REStringIsTrendingPromo(NSString *s) {
+    return REBool(kREHideTrending, YES) && REMatchesAny(s, RETrendingMarkers());
+}
+
+static BOOL REStringIsAnswersPromo(NSString *s) {
+    return REBool(kREHideAnswers, YES) && REMatchesAny(s, REAnswersMarkerList());
+}
+
 static BOOL REStringIsPromo(NSString *s) {
-    return REStringIsGamePromo(s) || REStringIsResourcePromo(s);
+    return REStringIsGamePromo(s) || REStringIsResourcePromo(s) ||
+           REStringIsTrendingPromo(s) || REStringIsAnswersPromo(s);
 }
 
 // 分区标题做「整串匹配」，避免误伤普通社区名
@@ -205,6 +227,7 @@ static NSSet<NSString *> *REPromoTitles(void) {
         set = [NSSet setWithArray:@[
             @"resources", @"reddit pro", @"try pro", @"try reddit pro",
             @"reddit premium", @"premium", @"earn", @"vault", @"trends",
+            @"trending", @"trending today", @"reddit answers", @"answers",
             @"advertise on reddit", @"reddit rules", @"privacy policy",
             @"user agreement", @"accessibility", @"help center",
             @"acknowledgements", @"impressum", @"osa information",
@@ -773,6 +796,18 @@ static void REFilterNode(NSMutableDictionary *node) {
                         strip = YES;
                     }
                 }
+                NSString *lowerCell = cellType.lowercaseString;
+                // 搜索页的 Trending 单元（SearchTrendingFeedUnit 等）
+                if (REBool(kREHideTrending, YES) &&
+                    ([lowerCell containsString:@"trending"] ||
+                     [lowerCell containsString:@"trends"])) {
+                    strip = YES;
+                }
+                // Reddit Answers 的预览 / 产品卡
+                if (REBool(kREHideAnswers, YES) &&
+                    REMatchesAny(lowerCell, REAnswersMarkerList())) {
+                    strip = YES;
+                }
             }
         }
         if (REBool(kREFilterPromoted, YES) &&
@@ -793,6 +828,24 @@ static void REFilterNode(NSMutableDictionary *node) {
         }
     }
 
+    // 趋势 / Answers 单元：多数是信息流里的独立节点，不在 CellGroup 里
+    if (type.length > 0) {
+        NSString *lowType = type.lowercaseString;
+        if (REBool(kREHideTrending, YES) &&
+            ([lowType containsString:@"trendingfeedunit"] ||
+             [lowType hasSuffix:@"trending"])) {
+            node[@"isHidden"] = @YES;
+            gCntAdStripped++;
+        }
+        if (REBool(kREHideAnswers, YES) &&
+            ([lowType containsString:@"answerspreview"] ||
+             [lowType containsString:@"answersproductcard"] ||
+             [lowType containsString:@"answershero"])) {
+            node[@"isHidden"] = @YES;
+            gCntAdStripped++;
+        }
+    }
+
     // 顶层广告 / 推荐容器：按键名通用匹配
     for (NSString *key in [node.allKeys copy]) {
         id value = node[key];
@@ -804,6 +857,17 @@ static void REFilterNode(NSMutableDictionary *node) {
             gCntAdStripped++;
         } else if (REBool(kREFilterRecommended, NO) &&
                    [lower containsString:@"recommend"]) {
+            node[key] = @[];
+            gCntAdStripped++;
+        } else if (REBool(kREHideTrending, YES) &&
+                   [lower containsString:@"trending"]) {
+            node[key] = @[];
+            gCntAdStripped++;
+        } else if (REBool(kREHideAnswers, YES) &&
+                   ([lower containsString:@"answersdiscovery"] ||
+                    [lower containsString:@"answerspreview"] ||
+                    [lower containsString:@"answerscarousel"] ||
+                    [lower containsString:@"answersunit"])) {
             node[key] = @[];
             gCntAdStripped++;
         }
@@ -1026,6 +1090,40 @@ static void REInstallReviewHook(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Hook: -[UIView setAccessibilityIdentifier:]
+// SwiftUI 里的「Ask Answers」按钮、搜索页 Trending 标题都带 UIIdentifier 的
+// rawValue 作为 accessibilityIdentifier；在这里拦下来直接隐藏，比遍历视图树便宜。
+// ---------------------------------------------------------------------------
+static BOOL REIdentifierShouldHide(NSString *ident) {
+    if (![ident isKindOfClass:[NSString class]] || ident.length == 0) return NO;
+    NSString *low = ident.lowercaseString;
+    if (REBool(kREHideAnswers, YES) && REMatchesAny(low, REAnswersMarkerList())) return YES;
+    if (REBool(kREHideTrending, YES) &&
+        ([low containsString:@"trendingtoday"] ||
+         [low containsString:@"screentrendingtopics"] ||
+         [low containsString:@"drawertrendstitle"])) return YES;
+    return NO;
+}
+
+static void REHookSetA11yIdentifier(id self, SEL _cmd, NSString *ident) {
+    void (*orig)(id, SEL, NSString *) = (void *)REOriIMP(self, _cmd);
+    if (orig) orig(self, _cmd, ident);
+
+    if (![self isKindOfClass:[UIView class]] || !REIdentifierShouldHide(ident)) return;
+    ((UIView *)self).hidden = YES;
+    gCntViewsHidden++;
+    RELogOnce([@"a11y|" stringByAppendingString:ident], @"按标识隐藏元素：%@", ident);
+}
+
+static void REInstallA11yHook(void) {
+    NSInteger before = gCntHooksInstalled;
+    RESwizzleClass([UIView class], @selector(setAccessibilityIdentifier:),
+                   (IMP)REHookSetA11yIdentifier);
+    RELog(@"无障碍标识 hook：%@",
+          gCntHooksInstalled > before ? @"已安装" : @"未安装（系统方法不存在）");
+}
+
+// ---------------------------------------------------------------------------
 // 设置项
 // ---------------------------------------------------------------------------
 // 设置页数据模型：分区 -> 行；最后一个分区是「其他」，只有一行（诊断入口）
@@ -1056,6 +1154,10 @@ static NSArray<NSDictionary *> *RESettingsModel(void) {
                        @"s": @"自动收起 AutoMod 机器人的回复", @"d": @NO },
                     @{ @"k": kREHidePremium,     @"t": @"隐藏 Premium 推广",
                        @"s": @"移除 Premium 横幅、升级提示与入口", @"d": @NO },
+                    @{ @"k": kREHideTrending,    @"t": @"隐藏趋势 / Trending",
+                       @"s": @"去掉搜索页的热门趋势与抽屉趋势分区", @"d": @YES },
+                    @{ @"k": kREHideAnswers,     @"t": @"隐藏 Reddit Answers 入口",
+                       @"s": @"去掉搜索栏「Ask Answers」与 AI 卡片", @"d": @YES },
                ]},
 
             @{ @"t": @"侧边栏（左侧抽屉）",
@@ -1140,6 +1242,7 @@ static NSString *REDiagnosticsText(void) {
     [text appendFormat:@"已安装 hook: %ld\n", (long)gCntHooksInstalled];
     [text appendFormat:@"接管抽屉表格: %ld\n", (long)gCntDrawerTables];
     [text appendFormat:@"折叠抽屉分区: %ld\n", (long)gCntSectionsHidden];
+    [text appendFormat:@"按标识隐藏元素: %ld\n", (long)gCntViewsHidden];
     [text appendFormat:@"拦截评分弹窗: %ld\n", (long)gCntReviewBlocked];
     [text appendString:@"\n== 网络 ==\n"];
     [text appendFormat:@"NSURLSession 命中: %ld\n", (long)gCntURLSession];
@@ -1533,6 +1636,7 @@ __attribute__((constructor)) static void REInitialize(void) {
         REInstallNetworkHook();
         REInstallJSONHook();
         REInstallReviewHook();
+        REInstallA11yHook();
 
         RESwizzleClass([UIViewController class],
                        @selector(viewDidAppear:),
@@ -1544,6 +1648,6 @@ __attribute__((constructor)) static void REInitialize(void) {
         REWriteDrawerCollapseKeys();
         REDiscoverDrawerTables();
 
-        RELog(@"RedditEnhancer v4 已加载（hook %ld 个）", (long)gCntHooksInstalled);
+        RELog(@"RedditEnhancer v4.2 已加载（hook %ld 个）", (long)gCntHooksInstalled);
     }
 }
