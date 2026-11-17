@@ -2,6 +2,9 @@
 //  RedditEnhancer — TrollStore tweak for Reddit 2026.46.0
 //  Bundle ID: com.reddit.Reddit   Executable: RedditApp
 //
+//  v6 —— 抽屉改成「白名单」：只保留 热门 / 新闻 / 最新 / 创建社区 /
+//        最近访问 / 你的社区，其余全部移除（按行高度归零，不留空白）。
+//
 //  v5 —— 去掉增强设置页里的「嵌套入口」+ 广告清理补全
 //
 //  v4 —— 修复 v3 崩溃 + 入口收敛到设置页导航栏
@@ -30,8 +33,9 @@
 //     会员状态完全由服务端下发 → 客户端无法真正解锁。
 //
 //  本版策略：
-//   1) 抽屉：只改行高 / header 高度 + 隐藏 cell，绝不改行数（崩溃点）。
-//      识别信号：类名 + accessibilityIdentifier + 文案（三重冗余）。
+//   1) 抽屉（v6 白名单）：行级按 accessibilityIdentifier 判定，只留六个入口；
+//      不要的行高度归零（= 真正移除，不留空白，也不碰行数）；分区标题不在
+//      保留列表的整段折叠。若某个分区里出现保留行，自动解折（自愈）。
 //   2) 设置入口：只保留设置页导航栏上的「增强设置」，去掉角落小胶囊按钮；
 //      并且自身界面可见时一律不再注入（v5 修掉「嵌套按钮」）。
 //   3) 新增：拦截广告 / 统计追踪请求；拦截 App Store 评分弹窗。
@@ -64,6 +68,7 @@ static NSString *const kREBlockTrackers       = @"RE.block.trackers";
 static NSString *const kREBlockReviewPrompt   = @"RE.block.reviewprompt";
 static NSString *const kREHideTrending        = @"RE.hide.trending";
 static NSString *const kREHideAnswers         = @"RE.hide.answers";
+static NSString *const kREDrawerWhitelist     = @"RE.drawer.whitelist";
 
 // Reddit 自己的抽屉折叠 key（写入作为次要手段）
 static NSString *const kRECollapsedGamesKey     = @"isGamesOnRedditCollapsed";
@@ -113,6 +118,7 @@ static NSObject *gRELogLock = nil;
 static NSDateFormatter *gREDateFmt = nil;
 static NSInteger gCntURLSession = 0, gCntJSON = 0, gCntNodes = 0;
 static NSInteger gCntAdStripped = 0, gCntDrawerTables = 0, gCntSectionsHidden = 0;
+static NSInteger gCntDrawerRowsHidden = 0;
 static NSInteger gCntTrackersBlocked = 0, gCntReviewBlocked = 0, gCntViewsHidden = 0;
 static NSInteger gCntHooksInstalled = 0;
 static NSInteger gCntAdNodesRemoved = 0;
@@ -364,6 +370,118 @@ static BOOL REViewIsPromo(UIView *view) {
 }
 
 // ---------------------------------------------------------------------------
+// 抽屉白名单（v6）
+// 只保留：热门 / 新闻 / 最新 / 创建社区 / 最近访问 / 你的社区，其余整行移除。
+// 依据 2026.46.0 二进制里 UIIdentifier 的 rawValue（后缀 ACvau 是混淆后缀）：
+//   保留  …E17DrawerPopularItem / …E14DrawerNewsItem / …E16DrawerLatestItem
+//         …e12DrawerCreateE4Item / …E25DrawerRecentlyVisitedItem
+//         …E29DrawerSubscribedSubredditItem（「你的社区」里每个社区）
+//   分区  …E28DrawerRecentlyVisitedSection / …E28DrawerYourCommunitiesSection
+//   移除  Discover / Favorites / Following / Moderating / Events / CustomFeeds /
+//         Games / Resources / About / Trends / 登录与管理入口 …
+// ---------------------------------------------------------------------------
+
+// 取视图里第一段可见文字（SwiftUI 自绘 cell 的文案挂在 accessibilityLabel 上）
+static NSString *REFirstTextInView(UIView *view, NSUInteger depth) {
+    if (!view || depth > 4) return nil;
+    if (view.accessibilityLabel.length) return view.accessibilityLabel;
+    if ([view isKindOfClass:[UILabel class]] && ((UILabel *)view).text.length) {
+        return ((UILabel *)view).text;
+    }
+    if ([view isKindOfClass:[UIButton class]]) {
+        NSString *t = [(UIButton *)view titleForState:UIControlStateNormal];
+        if (t.length) return t;
+    }
+    for (UIView *sub in view.subviews) {
+        NSString *t = REFirstTextInView(sub, depth + 1);
+        if (t.length) return t;
+    }
+    return nil;
+}
+
+// 要保留的行（小写子串）。标识和文案都能匹配。
+static NSArray<NSString *> *REDrawerKeepRowMarkers(void) {
+    return @[@"drawerpopularitem", @"popularitem", @"drawernewsitem", @"newsitem",
+             @"drawerlatestitem", @"latestitem",
+             @"drawercreate", @"createcommunity", @"createcommunityitem",
+             @"recentlyvisited",
+             @"subscribedsubreddititem", @"yourcommunities",
+             // 未登录时的登录入口：不能删，否则无法登录
+             @"loginitem",
+             // 中文本地化文案兜底
+             @"热门", @"新闻", @"最新", @"创建社区", @"最近访问", @"你的社区"];
+}
+
+// 已知的「垃圾行」文案（只在拿不到标识时才用来兜底判断）
+static NSArray<NSString *> *REDrawerJunkRowTexts(void) {
+    return @[@"发现社区", @"自定义信息流", @"收藏", @"关注", @"我管理的", @"版主",
+             @"活动", @"游戏", @"资源", @"关于", @"规则", @"隐私", @"用户协议",
+             @"服务条款", @"帮助", @"辅助功能", @"鸣谢",
+             @"discover communities", @"custom feeds", @"favorites", @"following",
+             @"moderating", @"events", @"games on reddit", @"resources", @"about",
+             @"reddit rules", @"privacy policy", @"user agreement", @"reddit pro",
+             @"premium", @"vault", @"earn", @"advertise", @"answers", @"trends"];
+}
+
+// 分区标题里出现这些词 → 一定不要（先判）
+static NSArray<NSString *> *REDrawerJunkTitleWords(void) {
+    return @[@"关于", @"规则", @"隐私", @"协议", @"条款", @"帮助", @"辅助", @"鸣谢",
+             @"版权", @"资源", @"游戏", @"趋势", @"发现", @"收藏", @"关注",
+             @"我管理的", @"版主", @"活动", @"自定义",
+             @"about", @"rules", @"privacy", @"agreement", @"terms", @"help",
+             @"acknowledg", @"impressum", @"resources", @"game", @"trend",
+             @"discover", @"favorit", @"following", @"moderating", @"event",
+             @"custom", @"pro", @"premium", @"vault", @"earn", @"advertise",
+             @"answers", @"osa"];
+}
+
+// 分区标题里出现这些词 → 保留
+static NSArray<NSString *> *REDrawerKeepTitleWords(void) {
+    return @[@"热门", @"新闻", @"最新", @"创建社区", @"最近访问", @"你的社区",
+             @"社区", @"订阅",
+             @"popular", @"news", @"latest", @"create community",
+             @"recently visited", @"your communities", @"communities",
+             @"subscribed", @"recent"];
+}
+
+// 抽屉里的一行长什么样：标识里同时带 drawer 和 item/cell
+static BOOL REStringLooksLikeDrawerRow(NSString *s) {
+    if (![s isKindOfClass:NSString.class] || s.length == 0) return NO;
+    NSString *low = s.lowercaseString;
+    if (![low containsString:@"drawer"]) return NO;
+    return [low containsString:@"item"] || [low containsString:@"cell"];
+}
+
+// 这一行要不要去掉
+static BOOL REDrawerRowShouldBlock(NSString *ident, NSString *text) {
+    if (!REBool(kREDrawerWhitelist, YES)) return NO;
+    NSString *lowIdent = [ident isKindOfClass:NSString.class] ? ident.lowercaseString : @"";
+
+    if (REStringLooksLikeDrawerRow(lowIdent)) {
+        return !REMatchesAny(lowIdent, REDrawerKeepRowMarkers());
+    }
+
+    // 拿不到标识时才看文案：认识的保留文案 → 留；认识的垃圾文案 → 去；都不认识 → 留
+    if (lowIdent.length == 0 && [text isKindOfClass:NSString.class] && text.length) {
+        NSString *lowText = text.lowercaseString;
+        if (REMatchesAny(lowText, REDrawerKeepRowMarkers())) return NO;
+        if (REMatchesAny(lowText, REDrawerJunkRowTexts())) return YES;
+    }
+    return NO;
+}
+
+// 这个分区标题要不要保留
+static BOOL REDrawerTitleShouldKeep(NSString *title) {
+    if (![title isKindOfClass:NSString.class] || title.length == 0) return YES;
+    NSString *low = [title.lowercaseString
+                     stringByTrimmingCharactersInSet:
+                     [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (low.length == 0) return YES;
+    if (REMatchesAny(low, REDrawerJunkTitleWords())) return NO;
+    return REMatchesAny(low, REDrawerKeepTitleWords());
+}
+
+// ---------------------------------------------------------------------------
 // Swizzle 基础设施（任意类；原始 IMP 按 "类名|方法名" 存表）
 // ---------------------------------------------------------------------------
 static NSMutableDictionary<NSString *, NSValue *> *gREOrigIMPs = nil;
@@ -522,9 +640,12 @@ static void REValidateHiddenSet(UITableView *tv) {
     }
 }
 
+// honorValve = YES  ：黑名单命中（可能误判），行数太多时放弃折叠
+// honorValve = NO   ：白名单判定（明确要删），一律折叠
 // 返回 YES 表示「这个分区确实被折掉了」——调用方据此决定要不要隐藏视图，
 // 避免安全阀拦下之后还留一个空白洞。
-static BOOL REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *reason) {
+static BOOL REMarkSectionHiddenEx(UITableView *tv, NSInteger section,
+                                  NSString *reason, BOOL honorValve) {
     if (!tv || section < 0) return NO;
     NSMutableIndexSet *set = RETableHiddenSet(tv, YES);
     if (!set) return NO;
@@ -533,19 +654,21 @@ static BOOL REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *re
     // 安全阀：分区行数过多说明它是「整块抽屉列表」而不是独立的推广分区，
     // 这时放弃折叠，避免因为一个 cell 文案匹配把整个侧边栏藏掉。
     // 但如果同一个分区里已经有多行命中推广特征，那就不是误匹配 —— 允许折叠。
-    NSInteger hits = REBumpSectionHit(tv, section);
-    id ds = tv.dataSource;
-    if (ds) {
-        SEL sel = @selector(tableView:numberOfRowsInSection:);
-        if ([ds respondsToSelector:sel]) {
-            NSInteger (*fn)(id, SEL, UITableView *, NSInteger) =
-                (void *)[ds methodForSelector:sel];
-            if (fn) {
-                NSInteger rows = fn(ds, sel, tv, section);
-                if (rows > 14 && hits < 3) {
-                    RELog(@"分区 #%ld 有 %ld 行、命中 %ld 次，暂不折叠（%@）",
-                          (long)section, (long)rows, (long)hits, reason);
-                    return NO;
+    if (honorValve) {
+        NSInteger hits = REBumpSectionHit(tv, section);
+        id ds = tv.dataSource;
+        if (ds) {
+            SEL sel = @selector(tableView:numberOfRowsInSection:);
+            if ([ds respondsToSelector:sel]) {
+                NSInteger (*fn)(id, SEL, UITableView *, NSInteger) =
+                    (void *)[ds methodForSelector:sel];
+                if (fn) {
+                    NSInteger rows = fn(ds, sel, tv, section);
+                    if (rows > 14 && hits < 3) {
+                        RELog(@"分区 #%ld 有 %ld 行、命中 %ld 次，暂不折叠（%@）",
+                              (long)section, (long)rows, (long)hits, reason);
+                        return NO;
+                    }
                 }
             }
         }
@@ -571,21 +694,204 @@ static BOOL REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *re
     return YES;
 }
 
+static BOOL REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *reason) {
+    return REMarkSectionHiddenEx(tv, section, reason, YES);
+}
+
+// ---------------------------------------------------------------------------
+// 白名单状态（行级）
+// 行状态按 tableView 存；结构（分区数/总行数）一变立刻清空，避免下标错位
+// —— v5 用「类名 → 分区下标」跨实例缓存时串过位，把正常分区折掉了。
+// ---------------------------------------------------------------------------
+static char kREBlockedRowsKey;
+static char kREKeptSectionsKey;
+static char kREDrawerSigKey;
+
+static NSString *RERowKeyFor(NSIndexPath *ip) {
+    return [NSString stringWithFormat:@"%ld.%ld", (long)ip.section, (long)ip.row];
+}
+
+static NSMutableDictionary<NSString *, NSString *> *REBlockedRows(UITableView *tv, BOOL create) {
+    if (!tv) return nil;
+    NSMutableDictionary *m = objc_getAssociatedObject(tv, &kREBlockedRowsKey);
+    if (!m && create) {
+        m = [NSMutableDictionary dictionary];
+        objc_setAssociatedObject(tv, &kREBlockedRowsKey, m,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return m;
+}
+
+static NSMutableIndexSet *REKeptSections(UITableView *tv, BOOL create) {
+    if (!tv) return nil;
+    NSMutableIndexSet *set = objc_getAssociatedObject(tv, &kREKeptSectionsKey);
+    if (!set && create) {
+        set = [NSMutableIndexSet indexSet];
+        objc_setAssociatedObject(tv, &kREKeptSectionsKey, set,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return set;
+}
+
+static NSString *REDrawerSignature(UITableView *tv) {
+    NSInteger sections = (NSInteger)tv.numberOfSections;
+    NSInteger total = 0;
+    for (NSInteger i = 0; i < sections; i++) {
+        total += [tv numberOfRowsInSection:i];
+    }
+    return [NSString stringWithFormat:@"%ld/%ld", (long)sections, (long)total];
+}
+
+static void REValidateDrawerState(UITableView *tv) {
+    if (!tv) return;
+    NSString *sig = REDrawerSignature(tv);
+    NSString *old = objc_getAssociatedObject(tv, &kREDrawerSigKey);
+    if (old && ![old isEqualToString:sig]) {
+        objc_setAssociatedObject(tv, &kREBlockedRowsKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(tv, &kREKeptSectionsKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (!old || ![old isEqualToString:sig]) {
+        objc_setAssociatedObject(tv, &kREDrawerSigKey, sig,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static BOOL REIsRowBlocked(UITableView *tv, NSIndexPath *ip) {
+    NSMutableDictionary *m = REBlockedRows(tv, NO);
+    return m != nil && m[RERowKeyFor(ip)] != nil;
+}
+
+static void REBlockRow(UITableView *tv, NSIndexPath *ip, NSString *reason) {
+    if (!tv || !ip) return;
+    NSMutableDictionary *m = REBlockedRows(tv, YES);
+    NSString *key = RERowKeyFor(ip);
+    if (m[key]) return;
+    m[key] = reason.length ? reason : @"?";
+    gCntDrawerRowsHidden++;
+    RELogOnce([@"row|" stringByAppendingString:key],
+              @"隐藏抽屉行 section=%ld row=%ld ← %@",
+              (long)ip.section, (long)ip.row, reason);
+    RELayoutNudge(tv);
+}
+
+static void REUnblockRow(UITableView *tv, NSIndexPath *ip) {
+    NSMutableDictionary *m = REBlockedRows(tv, NO);
+    if (!m || !ip) return;
+    NSString *key = RERowKeyFor(ip);
+    if (!m[key]) return;
+    [m removeObjectForKey:key];
+    RELayoutNudge(tv);
+}
+
+// 统一裁决：这一行留还是删。返回 YES 表示要隐藏。
+// 1) 白名单：整行移除（高度归零，不留空白）
+// 2) 真广告：逐行隐藏
+// 3) 旧的黑名单推广 cell：跟着整段折叠走
+static BOOL REApplyRowPolicy(UITableView *tv, UITableViewCell *cell, NSIndexPath *ip) {
+    if (!tv || !cell || !ip) return NO;
+
+    NSString *ident = cell.accessibilityIdentifier;
+    NSString *text  = REFirstTextInView(cell, 0);
+
+    if (REDrawerRowShouldBlock(ident, text)) {
+        REBlockRow(tv, ip, ident.length ? ident : text);
+        return YES;
+    }
+
+    // 这一行要保留，但它所在的分区被白名单按标题折掉了 → 解折（自愈）
+    NSMutableIndexSet *hidden = RETableHiddenSet(tv, NO);
+    if (hidden && [hidden containsIndex:ip.section]) {
+        [REKeptSections(tv, YES) addIndex:ip.section];
+        [hidden removeIndex:ip.section];
+        RELog(@"分区 #%ld 里出现了保留行，取消折叠（%@）",
+              (long)ip.section, ident.length ? ident : text);
+        RELayoutNudge(tv);
+    }
+    REUnblockRow(tv, ip);
+
+    if (REViewIsAdCell(cell)) return YES;
+
+    if (REViewIsPromo(cell)) {
+        if (REMarkSectionHidden(tv, ip.section, @"推广 cell")) return YES;
+    }
+    return NO;
+}
+
+// 分区标题 / 分区头视图 → 决定要不要整段折叠
+static void REApplySectionPolicy(UITableView *tv, NSInteger section,
+                                 NSString *title, NSString *headerIdent) {
+    if (!tv || section < 0) return;
+    if (!REBool(kREDrawerWhitelist, YES)) return;
+
+    NSMutableIndexSet *kept = REKeptSections(tv, NO);
+    if (kept && [kept containsIndex:section]) return;   // 里面有保留行，别折
+
+    // 分区头的无障碍标识带 drawer 的，直接按黑名单
+    NSString *lowIdent = [headerIdent isKindOfClass:NSString.class]
+                         ? headerIdent.lowercaseString : @"";
+    if (lowIdent.length) {
+        if (REStringLooksLikeDrawerRow(lowIdent) &&
+            REMatchesAny(lowIdent, @[@"game", @"gamecell", @"discovermoregames"])) {
+            REMarkSectionHiddenEx(tv, section, @"白名单：游戏分区头", NO);
+            return;
+        }
+        if (REMatchesAny(lowIdent, @[@"aboutsection", @"resourcessection",
+                                     @"trendstitle", @"discoversection",
+                                     @"discoverysection", @"favoritessection",
+                                     @"followingsection", @"moderatingsection",
+                                     @"eventssection", @"customfeeds"])) {
+            REMarkSectionHiddenEx(tv, section, @"白名单：分区标识", NO);
+            return;
+        }
+    }
+
+    if ([title isKindOfClass:NSString.class] && title.length) {
+        if (!REDrawerTitleShouldKeep(title)) {
+            REMarkSectionHiddenEx(tv, section, @"白名单：标题不在保留列表", NO);
+        }
+        return;
+    }
+
+    // 没有标题也没有标识 → 不动（顶部那一组行由行级规则逐个裁决）
+}
+
+
 // --- 具体 hook ---
 // 注意：没有 numberOfRowsInSection / numberOfSections 的 hook。
 // 抽屉是 diffable data source，行数一旦被改写，UIKit 会抛
 // NSInternalInconsistencyException（Invalid update）直接 abort —— 这是 v3 崩溃点。
 
+static BOOL RESectionIsHidden(UITableView *tv, NSInteger section);
+
 static CGFloat REHookHeightForRow(id self, SEL _cmd, UITableView *tv, NSIndexPath *indexPath) {
     REValidateHiddenSet(tv);
+    REValidateDrawerState(tv);
     NSMutableIndexSet *set = RETableHiddenSet(tv, NO);
     if (set && [set containsIndex:indexPath.section]) return 0.0;
+    // 白名单判定要删的行：高度归零 = 真正移除（不留空白，也不碰行数）
+    if (REIsRowBlocked(tv, indexPath)) return 0.0;
 
     CGFloat (*orig)(id, SEL, UITableView *, NSIndexPath *) = (void *)REOriIMP(self, _cmd);
     if (orig) return orig(self, _cmd, tv, indexPath);
     // 原来没有实现这个方法（cell 自撑高）：保持表格自身配置，不要硬塞自动高度
     return tv.rowHeight > 0 ? tv.rowHeight : UITableViewAutomaticDimension;
 }
+
+// 表格若用估算行高，被删的行会先按估算值占位（表现为一条空白），
+// 这里一并归零，布局时就不会闪出空白条。
+static CGFloat REHookEstimatedHeightForRow(id self, SEL _cmd, UITableView *tv,
+                                           NSIndexPath *indexPath) {
+    NSMutableIndexSet *set = RETableHiddenSet(tv, NO);
+    if (set && [set containsIndex:indexPath.section]) return 0.0;
+    if (REIsRowBlocked(tv, indexPath)) return 0.0;
+
+    CGFloat (*orig)(id, SEL, UITableView *, NSIndexPath *) = (void *)REOriIMP(self, _cmd);
+    if (orig) return orig(self, _cmd, tv, indexPath);
+    return tv.estimatedRowHeight > 0 ? tv.estimatedRowHeight : 0.0;
+}
+
 
 static CGFloat REHookHeightForHeader(id self, SEL _cmd, UITableView *tv, NSInteger section) {
     REValidateHiddenSet(tv);
@@ -624,7 +930,15 @@ static NSString *REHookTitleForHeader(id self, SEL _cmd, UITableView *tv, NSInte
     if ([title isKindOfClass:[NSString class]] && title.length > 0) {
         RELogOnce([@"hdr|" stringByAppendingString:title], @"抽屉分区标题：%@", title);
     }
-    if (RETableIsDrawer(tv) && RETitleIsPromo(title)) {
+    if (!RETableIsDrawer(tv)) return title;
+
+    if (REBool(kREDrawerWhitelist, YES)) {
+        REApplySectionPolicy(tv, section, title, nil);
+        if (RESectionIsHidden(tv, section)) return nil;
+        return title;
+    }
+
+    if (RETitleIsPromo(title)) {
         REMarkSectionHidden(tv, section, @"分区标题");
         return nil;
     }
@@ -640,7 +954,19 @@ static BOOL RESectionIsHidden(UITableView *tv, NSInteger section) {
 static UIView *REHookViewForHeader(id self, SEL _cmd, UITableView *tv, NSInteger section) {
     UIView *(*orig)(id, SEL, UITableView *, NSInteger) = (void *)REOriIMP(self, _cmd);
     UIView *view = orig ? orig(self, _cmd, tv, section) : nil;
-    if (RETableIsDrawer(tv) && view && REViewIsPromo(view)) {
+    if (!RETableIsDrawer(tv) || !view) return view;
+
+    if (REBool(kREDrawerWhitelist, YES)) {
+        REApplySectionPolicy(tv, section, REFirstTextInView(view, 0),
+                            view.accessibilityIdentifier);
+        if (RESectionIsHidden(tv, section)) {
+            view.hidden = YES;
+            return nil;
+        }
+        return view;
+    }
+
+    if (REViewIsPromo(view)) {
         REMarkSectionHidden(tv, section, @"分区头视图");
         if (RESectionIsHidden(tv, section)) {
             view.hidden = YES;
@@ -653,27 +979,21 @@ static UIView *REHookViewForHeader(id self, SEL _cmd, UITableView *tv, NSInteger
 static UITableViewCell *REHookCellForRow(id self, SEL _cmd, UITableView *tv, NSIndexPath *indexPath) {
     UITableViewCell *(*orig)(id, SEL, UITableView *, NSIndexPath *) = (void *)REOriIMP(self, _cmd);
     UITableViewCell *cell = orig ? orig(self, _cmd, tv, indexPath) : nil;
+    if (!cell || !RETableIsDrawer(tv)) return cell;
+
+    REValidateDrawerState(tv);
 
     // 留档：抽屉里真实出现的 cell 类名 + 无障碍标识，便于下次精确匹配
-    if (cell && RETableIsDrawer(tv)) {
-        NSString *cls = NSStringFromClass([cell class]) ?: @"?";
-        NSString *ident = cell.accessibilityIdentifier ?: @"";
-        NSString *key = [NSString stringWithFormat:@"cell|%@|%@|%ld",
-                         cls, ident, (long)indexPath.section];
-        RELogOnce(key, @"抽屉 cell：%@ ident=%@ section=%ld",
-                  cls, ident.length ? ident : @"(无)", (long)indexPath.section);
-    }
+    NSString *cls = NSStringFromClass([cell class]) ?: @"?";
+    NSString *ident = cell.accessibilityIdentifier ?: @"";
+    RELogOnce([NSString stringWithFormat:@"cell|%@|%@|%ld", cls, ident, (long)indexPath.section],
+              @"抽屉 cell：%@ ident=%@ section=%ld",
+              cls, ident.length ? ident : @"(无)", (long)indexPath.section);
 
-    if (RETableIsDrawer(tv) && cell) {
-        BOOL promo = REViewIsPromo(cell);
-        BOOL folded = promo ? REMarkSectionHidden(tv, indexPath.section, @"推广 cell") : NO;
-        // 整段折掉时 cell 本来高度就是 0；折不掉时只有「真广告」才逐行藏，
-        // 其它（关于/规则/隐私/协议）保持原样，绝不靠隐藏行来凑，避免空白块。
-        // alpha 一并还原，否则复用到别的行会变成透明（看着就是一块空白）。
-        BOOL hide = folded || REViewIsAdCell(cell);
-        cell.hidden = hide;
-        cell.alpha = hide ? 0.0 : 1.0;
-    }
+    // alpha 必须一并还原，否则复用时会变透明（看着就是一块空白）
+    BOOL hide = REApplyRowPolicy(tv, cell, indexPath);
+    cell.hidden = hide;
+    cell.alpha = hide ? 0.0 : 1.0;
     return cell;
 }
 
@@ -683,13 +1003,10 @@ static void REHookWillDisplayCell(id self, SEL _cmd, UITableView *tv,
         (void *)REOriIMP(self, _cmd);
     if (orig) orig(self, _cmd, tv, cell, indexPath);
 
-    if (RETableIsDrawer(tv) && cell) {
-        BOOL promo = REViewIsPromo(cell);
-        BOOL folded = promo ? REMarkSectionHidden(tv, indexPath.section, @"cell 显示") : NO;
-        BOOL hide = folded || REViewIsAdCell(cell);
-        cell.hidden = hide;
-        cell.alpha = hide ? 0.0 : 1.0;
-    }
+    if (!RETableIsDrawer(tv) || !cell) return;
+    BOOL hide = REApplyRowPolicy(tv, cell, indexPath);
+    cell.hidden = hide;
+    cell.alpha = hide ? 0.0 : 1.0;
 }
 
 static void REHookWillDisplayHeader(id self, SEL _cmd, UITableView *tv,
@@ -697,11 +1014,21 @@ static void REHookWillDisplayHeader(id self, SEL _cmd, UITableView *tv,
     void (*orig)(id, SEL, UITableView *, UIView *, NSInteger) = (void *)REOriIMP(self, _cmd);
     if (orig) orig(self, _cmd, tv, view, section);
 
-    if (RETableIsDrawer(tv) && view && REViewIsPromo(view)) {
+    if (!RETableIsDrawer(tv) || !view) return;
+
+    if (REBool(kREDrawerWhitelist, YES)) {
+        REApplySectionPolicy(tv, section, REFirstTextInView(view, 0),
+                            view.accessibilityIdentifier);
+        if (RESectionIsHidden(tv, section)) view.hidden = YES;
+        return;
+    }
+
+    if (REViewIsPromo(view)) {
         REMarkSectionHidden(tv, section, @"header 显示");
         if (RESectionIsHidden(tv, section)) view.hidden = YES;
     }
 }
+
 
 static BOOL REIsDrawerName(NSString *name) {
     if (![name isKindOfClass:[NSString class]] || name.length == 0) return NO;
@@ -741,6 +1068,13 @@ static void REInstallFiltersOnTable(UITableView *tableView) {
     for (id obj in targets) {
         RESwizzleInstance(obj, @selector(tableView:heightForRowAtIndexPath:),
                           (IMP)REHookHeightForRow);
+        // 只有原本就实现了「估算行高」才接管：否则硬加这个方法会让所有行
+        // 先按估算值占位，等于改变了整个表格的布局行为。
+        if (class_getInstanceMethod(object_getClass(obj),
+                                    @selector(tableView:estimatedHeightForRowAtIndexPath:))) {
+            RESwizzleInstance(obj, @selector(tableView:estimatedHeightForRowAtIndexPath:),
+                              (IMP)REHookEstimatedHeightForRow);
+        }
         RESwizzleInstance(obj, @selector(tableView:heightForHeaderInSection:),
                           (IMP)REHookHeightForHeader);
         RESwizzleInstance(obj, @selector(tableView:heightForFooterInSection:),
@@ -820,12 +1154,18 @@ static void REResetDrawerCache(void) {
             }
         }
         for (UITableView *tv in tables) {
-            // 重新探测：清掉旧下标和旧的分区数基准
+            // 重新探测：清掉旧下标、旧分区数基准、旧的按行状态
             objc_setAssociatedObject(tv, &kREHiddenSectionsKey, nil,
                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(tv, &kRESectionCountKey, nil,
                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(tv, &kRESectionHitKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(tv, &kREBlockedRowsKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(tv, &kREKeptSectionsKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(tv, &kREDrawerSigKey, nil,
                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             for (UITableViewCell *cell in tv.visibleCells) {
                 cell.hidden = NO;
@@ -1372,6 +1712,8 @@ static NSArray<NSDictionary *> *RESettingsModel(void) {
             @{ @"t": @"侧边栏（左侧抽屉）",
                @"f": @"打开左侧抽屉时生效；若没变化，去「其他 → 诊断信息」看命中数。",
                @"rows": @[
+                    @{ @"k": kREDrawerWhitelist,     @"t": @"只保留核心入口",
+                       @"s": @"只留热门、新闻、最新、创建社区、最近访问、你的社区，其余全部移除", @"d": @YES },
                     @{ @"k": kREHideDrawerGames,     @"t": @"隐藏「Reddit 上的游戏」",
                        @"s": @"折叠抽屉里的 Devvit 游戏推荐分区", @"d": @YES },
                     @{ @"k": kREHideDrawerResources, @"t": @"隐藏「资源 / 关于」分区",
@@ -1451,6 +1793,8 @@ static NSString *REDiagnosticsText(void) {
     [text appendFormat:@"已安装 hook: %ld\n", (long)gCntHooksInstalled];
     [text appendFormat:@"接管抽屉表格: %ld\n", (long)gCntDrawerTables];
     [text appendFormat:@"折叠抽屉分区: %ld\n", (long)gCntSectionsHidden];
+    [text appendFormat:@"移除抽屉行: %ld\n", (long)gCntDrawerRowsHidden];
+    [text appendFormat:@"白名单模式: %@\n", REBool(kREDrawerWhitelist, YES) ? @"开" : @"关"];
     [text appendFormat:@"按标识隐藏元素: %ld\n", (long)gCntViewsHidden];
     [text appendFormat:@"拦截评分弹窗: %ld\n", (long)gCntReviewBlocked];
     [text appendString:@"\n== 网络 ==\n"];
@@ -1726,7 +2070,8 @@ static void REStripEntryFromBarsOf(UIViewController *vc) {
     RELog(@"开关 %@ = %@", row[@"t"], sender.on ? @"开" : @"关");
 
     if ([key isEqualToString:kREHideDrawerGames] ||
-        [key isEqualToString:kREHideDrawerResources]) {
+        [key isEqualToString:kREHideDrawerResources] ||
+        [key isEqualToString:kREDrawerWhitelist]) {
         REResetDrawerCache();
     }
 }
@@ -1963,6 +2308,6 @@ __attribute__((constructor)) static void REInitialize(void) {
         REWriteDrawerCollapseKeys();
         REDiscoverDrawerTables();
 
-        RELog(@"RedditEnhancer v5.2 已加载（hook %ld 个）", (long)gCntHooksInstalled);
+        RELog(@"RedditEnhancer v6 已加载（hook %ld 个）", (long)gCntHooksInstalled);
     }
 }
