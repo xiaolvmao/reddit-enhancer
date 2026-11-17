@@ -40,11 +40,14 @@
 5. **隐藏投票数** — 隐藏票数（利用 `isScoreHidden`）
 
 **侧边栏（左侧抽屉）**
-6. **只保留核心入口**（默认开，v6）— 抽屉只留 **热门 / 新闻 / 最新 / 创建社区 / 最近访问 / 你的社区**，
+6. **完全隐藏侧边栏**（默认开，v7）— 抽屉**彻底不出现**：在
+   `-[UIViewController presentViewController:animated:completion:]` 里直接拒绝呈现
+   `CommunityDrawer*`，连数据都不再拉取。想恢复抽屉把这个开关关掉即可
+7. **只保留核心入口**（默认开，v6）— 抽屉只留 **热门 / 新闻 / 最新 / 创建社区 / 最近访问 / 你的社区**，
    其余（发现社区、自定义信息流、收藏、关注、我管理的、版主、活动、游戏、资源、关于、规则、
    隐私政策、用户协议…）全部移除
-7. **隐藏「Reddit 上的游戏」**（默认开）— 白名单模式关闭时的后备开关
-8. **隐藏「资源 / 关于」分区**（默认开）— 白名单模式关闭时的后备开关
+8. **隐藏「Reddit 上的游戏」**（默认开）— 白名单模式关闭时的后备开关
+9. **隐藏「资源 / 关于」分区**（默认开）— 白名单模式关闭时的后备开关
 
 **界面精简**
 8. **折叠 AutoMod 评论** — 自动折叠 AutoMod 机器人的回复
@@ -55,6 +58,13 @@
 **隐私与体验**
 10. **屏蔽广告与统计追踪**（默认开）— 拦截 `ads.reddit.com`／`ads-api.reddit.com`／`alb.reddit.com`／`pixel-config.reddit.com`／Appsflyer／Firebase／Braze／Sentry 等域名，请求不出网
 11. **屏蔽 App Store 评分弹窗**（默认开）— Hook `SKStoreReviewController requestReview`
+12. **屏蔽「速率限制」提示**（默认开，v7）— 拦 `UIAlertController` 与挂在窗口上的浮层提示条，
+    文案命中 `速率限制 / 请求过于频繁 / rate limit / too many requests` 才动手，普通报错不受影响
+
+> **「速率限制」提示说明（重要）**：这是**服务器**对同一动作做频率限制后的报错
+> （`spamRateLimitMessage` / `rateLimitBanner` / `CommunityDrawerTableViewFailedCell` 都出自服务端响应）。
+> 插件只能把提示藏起来，**不能解除限制本身** —— 被限流时发帖/评论/投票依旧会失败，
+> 只是不再被打断。想减少触发频率，主要是别在短时间内连续做同类操作。
 
 > **「折叠 AutoMod 评论」说明**：Subreddit 的 AutoMod 是自动管理机器人，常发置顶规则/说明。开启后，它发的评论在加载时默认是折叠状态（点一下仍可展开），让评论区优先显示真实用户的讨论。默认关闭。
 >
@@ -90,6 +100,16 @@
 > - v4 改为**只动高度**，不再碰行数、不 reloadData。v6 沿用这个安全边界。
 > - v5.2 修掉「逐行隐藏留空白」和「分区下标跨实例缓存导致错折正常分区」。
 >
+> **完全隐藏抽屉是怎么做的（v7）**：二进制里抽屉走的是**模态呈现** —— `DrawerPresentationController`
+> + `DrawerAnimator` + `initWithDrawerViewController:`，打开入口是 `CommunityDrawerEdgePanManagerImpl`
+> 的边滑手势和 `CommunityDrawerBarButtonItem`。所以在
+> `-[UIViewController presentViewController:animated:completion:]` 里判定「要呈现的 VC
+> （或它包着的导航栈）类名含 `CommunityDrawer`」就直接 `return`：抽屉不会创建视图，
+> 也不会再去拉 `CommunityDrawerItemsQuery`（限流提示的常见来源）。
+> 兜底（万一走的是 `addChildViewController` 而不是模态）：`viewWillAppear:` 时把整个呈现容器
+> （连调暗遮罩）设成 `hidden` + `userInteractionEnabled = NO`，再 `dismissViewControllerAnimated:NO`。
+> hidden 的视图不参与 hitTest，所以即使 dismiss 没成功，也不会出现「看不见的模态层吃掉所有点击」。
+>
 > **趋势 / Answers 是怎么去掉的（v4.2）**：这两块是 SwiftUI 页面，没有可 hook 的 UIKit 类，
 > 但 Reddit 会把 `UIIdentifier` 枚举的 rawValue 写进 `accessibilityIdentifier`。所以走两条路：
 > ① JSON 层：把 `SearchTrendingFeedUnit`、`SearchAnswersPreview*`、`AnswersProductCard/Hero`
@@ -117,7 +137,7 @@
 > ④ 进页面时主动把导航栏里带「增强」字样的按钮摘掉（幂等兜底）。
 >
 > **诊断页**：增强设置 → 其他 → 诊断信息。会显示 hook 安装数、抽屉表格接管数、被折叠的分区数、
-> 拦截的追踪请求数、网络命中次数、全部开关状态与实时日志；日志里还会**留档抽屉里出现过的每个
+> 拦截打开抽屉次数、屏蔽限流提示次数、拦截的追踪请求数、网络命中次数、全部开关状态与实时日志；日志里还会**留档抽屉里出现过的每个
 > cell 类名 / 无障碍标识 / 分区标题**，反馈时截图即可精确定位。
 
 其他优化（已内置、无需开关）：

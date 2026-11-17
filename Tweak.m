@@ -2,6 +2,12 @@
 //  RedditEnhancer — TrollStore tweak for Reddit 2026.46.0
 //  Bundle ID: com.reddit.Reddit   Executable: RedditApp
 //
+//  v7 —— ① 可选「完全隐藏侧边栏」：在 presentViewController 层直接拒绝
+//        打开 CommunityDrawerViewController（默认开），抽屉根本不会出现，
+//        也就不会再去拉 CommunityDrawerItemsQuery（限流提示的来源之一）。
+//        ② 新增「屏蔽速率限制提示」：拦 UIAlertController + 浮层 UILabel。
+//        注意：这是展示层屏蔽，服务器的限流仍然存在（发帖/评论仍可能被拒）。
+//
 //  v6 —— 抽屉改成「白名单」：只保留 热门 / 新闻 / 最新 / 创建社区 /
 //        最近访问 / 你的社区，其余全部移除（按行高度归零，不留空白）。
 //
@@ -69,6 +75,8 @@ static NSString *const kREBlockReviewPrompt   = @"RE.block.reviewprompt";
 static NSString *const kREHideTrending        = @"RE.hide.trending";
 static NSString *const kREHideAnswers         = @"RE.hide.answers";
 static NSString *const kREDrawerWhitelist     = @"RE.drawer.whitelist";
+static NSString *const kREHideDrawerAll       = @"RE.hide.drawer";
+static NSString *const kREBlockRateLimit      = @"RE.block.ratelimit";
 
 // Reddit 自己的抽屉折叠 key（写入作为次要手段）
 static NSString *const kRECollapsedGamesKey     = @"isGamesOnRedditCollapsed";
@@ -122,6 +130,8 @@ static NSInteger gCntDrawerRowsHidden = 0;
 static NSInteger gCntTrackersBlocked = 0, gCntReviewBlocked = 0, gCntViewsHidden = 0;
 static NSInteger gCntHooksInstalled = 0;
 static NSInteger gCntAdNodesRemoved = 0;
+static NSInteger gCntDrawerBlocked = 0;
+static NSInteger gCntRateLimitSuppressed = 0;
 
 // 我们自己的设置页 / 诊断页正在前台时 > 0。
 // 此时绝不能再往任何导航栏注入「增强设置」入口 —— 否则会出现
@@ -1085,6 +1095,173 @@ static BOOL REViewBelongsToDrawer(UIView *view) {
     return NO;
 }
 
+// ---------------------------------------------------------------------------
+// v7：完全隐藏左侧抽屉 + 屏蔽「速率限制」提示
+// ---------------------------------------------------------------------------
+// 抽屉是「模态呈现」的（二进制里 DrawerPresentationController / DrawerAnimator
+// / initWithDrawerViewController:），所以最干净的关法是：在
+// -[UIViewController presentViewController:animated:completion:] 里直接拒绝。
+// 拦不住的情况（容器直接 addChildViewController，或自定义交互式转场已经在跑）
+// 再由 viewWillAppear 兜底：把呈现容器整层藏掉 + 立刻 dismiss，避免出现
+// 「看不见的模态层吃掉所有点击」。
+static BOOL REIsCommunityDrawerClass(NSString *name) {
+    return [name isKindOfClass:NSString.class] &&
+           name.length > 0 &&
+           [name containsString:@"CommunityDrawer"];
+}
+
+static BOOL REIsCommunityDrawerVC(UIViewController *vc) {
+    if (!vc) return NO;
+    if (REIsCommunityDrawerClass(NSStringFromClass([vc class]))) return YES;
+    if ([vc isKindOfClass:[UINavigationController class]]) {
+        UINavigationController *nav = (UINavigationController *)vc;
+        if (nav.topViewController != nav && REIsCommunityDrawerVC(nav.topViewController)) return YES;
+        if (nav.viewControllers.firstObject != nav &&
+            REIsCommunityDrawerVC(nav.viewControllers.firstObject)) return YES;
+    }
+    return NO;
+}
+
+// 「限流」文案识别。只认明确的措辞，避免把普通的「请稍后重试」也吞掉。
+static BOOL REStringIsRateLimitPrompt(NSString *text) {
+    if (![text isKindOfClass:NSString.class] || text.length < 4 || text.length > 400) return NO;
+
+    // 热路径（UILabel setText:）先用最便宜的字符探测挡掉 99% 的普通文案，
+    // 避免每次都做 lowercase 分配。
+    BOOL maybe = [text rangeOfString:@"限"].location != NSNotFound ||
+                 [text rangeOfString:@"频繁"].location != NSNotFound ||
+                 [text rangeOfString:@"rate" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                 [text rangeOfString:@"too much" options:NSCaseInsensitiveSearch].location != NSNotFound;
+    if (!maybe) return NO;
+
+    NSArray<NSString *> *patterns = @[
+        @"速率限制", @"请求过于频繁", @"请求太频繁", @"操作过于频繁", @"操作太频繁",
+        @"请求过快", @"操作过快", @"被限流",
+        @"rate limit", @"rate-limit", @"ratelimit", @"too many requests",
+        @"doing that too much"
+    ];
+    return REMatchesAny(text.lowercaseString, patterns);
+}
+
+static void REHookPresentVC(id self, SEL _cmd, UIViewController *vc,
+                            BOOL animated, void (^completion)(void)) {
+    void (*orig)(id, SEL, UIViewController *, BOOL, void (^)(void)) =
+        (void *)REOriIMP(self, _cmd);
+
+    if (vc) {
+        // 1) 完全隐藏侧边栏：抽屉一律不许被呈现
+        if (REBool(kREHideDrawerAll, YES) && REIsCommunityDrawerVC(vc)) {
+            gCntDrawerBlocked++;
+            RELogOnce(@"block|drawer-present", @"拦截打开左侧抽屉（%@）",
+                      NSStringFromClass([vc class]));
+            return;
+        }
+        // 2) 限流弹窗：UIAlertController 的标题或正文命中就直接不弹
+        if (REBool(kREBlockRateLimit, YES) &&
+            [vc isKindOfClass:[UIAlertController class]]) {
+            UIAlertController *alert = (UIAlertController *)vc;
+            if (REStringIsRateLimitPrompt(alert.title) ||
+                REStringIsRateLimitPrompt(alert.message)) {
+                gCntRateLimitSuppressed++;
+                RELogOnce(@"block|ratelimit-alert", @"拦截限流弹窗：%@",
+                          alert.message.length ? alert.message : alert.title);
+                return;
+            }
+        }
+    }
+    if (orig) orig(self, _cmd, vc, animated, completion);
+}
+
+// presenter 的模态链里是否真的挂着 vc（只有这种情况才可以 dismiss /
+// 才可以去藏「呈现容器」，否则可能把主界面一起藏掉）
+static BOOL REPresenterHoldsVC(UIViewController *presenter, UIViewController *vc) {
+    if (!presenter || !vc) return NO;
+    UIViewController *top = presenter.presentedViewController;
+    for (int i = 0; top && i < 4; i++) {
+        if (top == vc) return YES;
+        if ([top isKindOfClass:[UINavigationController class]] &&
+            [(UINavigationController *)top viewControllers].count &&
+            [[(UINavigationController *)top viewControllers] containsObject:vc]) return YES;
+        top = top.presentedViewController;
+    }
+    return NO;
+}
+
+// 抽屉已经跑到显示阶段才被我们发现（转场绕过了 present 钩子）：
+// 把整个呈现容器藏掉（连调暗遮罩一起），并立即关闭。
+// hidden 的视图不参与 hitTest，所以即使 dismiss 失败也不会卡死界面。
+static void REHideDrawerVC(UIViewController *vc) {
+    if (!vc) return;
+    UIView *view = vc.isViewLoaded ? vc.view : nil;
+    UIViewController *presenter = vc.presentingViewController;
+    BOOL held = REPresenterHoldsVC(presenter, vc);
+
+    if (view) {
+        UIView *container = view.superview;
+        UIView *target = (held && container) ? container : view;
+        target.hidden = YES;
+        target.alpha = 0.0;
+        target.userInteractionEnabled = NO;
+    }
+    gCntDrawerBlocked++;
+    RELogOnce(@"block|drawer-visible", @"抽屉已出现，强制隐藏（%@）",
+              NSStringFromClass([vc class]));
+
+    // 作为 child 存在时 dismiss 会误伤整个主界面 → 只藏不关
+    if (!held) return;
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [presenter dismissViewControllerAnimated:NO completion:nil];
+    });
+}
+
+static void REInstallDrawerBlockHooks(void) {
+    RESwizzleClass([UIViewController class],
+                   @selector(presentViewController:animated:completion:),
+                   (IMP)REHookPresentVC);
+}
+
+// 浮层提示条（toast / snackbar）里的限流文案：只处理「直接挂在 UIWindow 上的
+// 那一层容器」，页面正文里的错误文字不碰。
+static void RESuppressRateLimitToast(UIView *label, NSString *text) {
+    if (!label || !REBool(kREBlockRateLimit, YES)) return;
+    if (!REStringIsRateLimitPrompt(text)) return;
+
+    UIView *view = label;
+    UIView *toast = nil;
+    for (int i = 0; i < 8 && view; i++) {
+        UIView *parent = view.superview;
+        if (!parent) break;
+        if ([parent isKindOfClass:[UIWindow class]]) { toast = view; break; }
+        view = parent;
+    }
+    if (!toast) return;
+
+    toast.hidden = YES;
+    toast.alpha = 0.0;
+    gCntRateLimitSuppressed++;
+    RELogOnce([@"block|ratelimit-toast|" stringByAppendingString:text],
+              @"拦截限流提示条：%@", text);
+}
+
+static void REHookLabelSetText(id self, SEL _cmd, NSString *text) {
+    void (*orig)(id, SEL, NSString *) = (void *)REOriIMP(self, _cmd);
+    if (orig) orig(self, _cmd, text);
+    RESuppressRateLimitToast((UIView *)self, text);
+}
+
+static void REHookLabelSetAttributedText(id self, SEL _cmd, NSAttributedString *text) {
+    void (*orig)(id, SEL, NSAttributedString *) = (void *)REOriIMP(self, _cmd);
+    if (orig) orig(self, _cmd, text);
+    RESuppressRateLimitToast((UIView *)self, text.string);
+}
+
+static void REInstallRateLimitHooks(void) {
+    RESwizzleClass([UILabel class], @selector(setText:), (IMP)REHookLabelSetText);
+    RESwizzleClass([UILabel class], @selector(setAttributedText:),
+                   (IMP)REHookLabelSetAttributedText);
+}
+
 static void REInstallFiltersOnTable(UITableView *tableView) {
     if (!tableView) return;
     if (objc_getAssociatedObject(tableView, &kREFiltersInstalledKey)) return;
@@ -1748,6 +1925,8 @@ static NSArray<NSDictionary *> *RESettingsModel(void) {
             @{ @"t": @"侧边栏（左侧抽屉）",
                @"f": @"打开左侧抽屉时生效；若没变化，去「其他 → 诊断信息」看命中数。",
                @"rows": @[
+                    @{ @"k": kREHideDrawerAll,       @"t": @"完全隐藏侧边栏",
+                       @"s": @"抽屉不再弹出，也不会再拉取抽屉数据（限流提示主要来源）", @"d": @YES },
                     @{ @"k": kREDrawerWhitelist,     @"t": @"只保留核心入口",
                        @"s": @"只留热门、新闻、最新、创建社区、最近访问、你的社区，其余全部移除", @"d": @YES },
                     @{ @"k": kREHideDrawerGames,     @"t": @"隐藏「Reddit 上的游戏」",
@@ -1763,6 +1942,8 @@ static NSArray<NSDictionary *> *RESettingsModel(void) {
                        @"s": @"拦截广告服务器与第三方统计域名", @"d": @YES },
                     @{ @"k": kREBlockReviewPrompt, @"t": @"屏蔽 App Store 评分弹窗",
                        @"s": @"不再弹出「给 Reddit 评分」", @"d": @YES },
+                    @{ @"k": kREBlockRateLimit,    @"t": @"屏蔽「速率限制」提示",
+                       @"s": @"不再弹「请求已受到速率限制，请等待 x 秒」（服务器限制仍在）", @"d": @YES },
                ]},
 
             @{ @"t": @"其他",
@@ -1830,6 +2011,8 @@ static NSString *REDiagnosticsText(void) {
     [text appendFormat:@"接管抽屉表格: %ld\n", (long)gCntDrawerTables];
     [text appendFormat:@"折叠抽屉分区: %ld\n", (long)gCntSectionsHidden];
     [text appendFormat:@"移除抽屉行: %ld\n", (long)gCntDrawerRowsHidden];
+    [text appendFormat:@"拦截打开抽屉: %ld\n", (long)gCntDrawerBlocked];
+    [text appendFormat:@"屏蔽限流提示: %ld\n", (long)gCntRateLimitSuppressed];
     [text appendFormat:@"白名单模式: %@\n", REBool(kREDrawerWhitelist, YES) ? @"开" : @"关"];
     [text appendFormat:@"按标识隐藏元素: %ld\n", (long)gCntViewsHidden];
     [text appendFormat:@"拦截评分弹窗: %ld\n", (long)gCntReviewBlocked];
@@ -2282,6 +2465,21 @@ static void REInjectEntryIntoPage(UIViewController *vc) {
     REScheduleEntryRetry(vc);
 }
 
+// 抽屉在显示前就被截住（present 钩子没拦到时）：先藏，再由 didAppear 收尾
+static void REHookedViewWillAppear(id self, SEL _cmd, BOOL animated) {
+    void (*orig)(id, SEL, BOOL) = (void *)REOriIMP(self, _cmd);
+    if (orig) orig(self, _cmd, animated);
+
+    if (![self isKindOfClass:[UIViewController class]]) return;
+    if (!REBool(kREHideDrawerAll, YES)) return;
+
+    UIViewController *vc = (UIViewController *)self;
+    if (REIsOwnVC(vc)) return;
+    if (!REIsCommunityDrawerVC(vc)) return;
+
+    REHideDrawerVC(vc);
+}
+
 static void REHookedViewDidAppear(id self, SEL _cmd, BOOL animated) {
     void (*orig)(id, SEL, BOOL) = (void *)REOriIMP(self, _cmd);
     if (orig) orig(self, _cmd, animated);
@@ -2290,6 +2488,12 @@ static void REHookedViewDidAppear(id self, SEL _cmd, BOOL animated) {
     UIViewController *vc = (UIViewController *)self;
     // 自己的设置页 / 诊断页 / 承载它们的导航控制器：一律不处理
     if (REIsOwnVC(vc)) return;
+
+    // 完全隐藏侧边栏：抽屉万一还是出现了，直接藏 + 关掉，不再做任何行过滤
+    if (REBool(kREHideDrawerAll, YES) && REIsCommunityDrawerVC(vc)) {
+        REHideDrawerVC(vc);
+        return;
+    }
 
     NSString *cls = NSStringFromClass([vc class]);
 
@@ -2333,7 +2537,12 @@ __attribute__((constructor)) static void REInitialize(void) {
         REInstallJSONHook();
         REInstallReviewHook();
         REInstallA11yHook();
+        REInstallDrawerBlockHooks();
+        REInstallRateLimitHooks();
 
+        RESwizzleClass([UIViewController class],
+                       @selector(viewWillAppear:),
+                       (IMP)REHookedViewWillAppear);
         RESwizzleClass([UIViewController class],
                        @selector(viewDidAppear:),
                        (IMP)REHookedViewDidAppear);
@@ -2344,6 +2553,6 @@ __attribute__((constructor)) static void REInitialize(void) {
         REWriteDrawerCollapseKeys();
         REDiscoverDrawerTables();
 
-        RELog(@"RedditEnhancer v6 已加载（hook %ld 个）", (long)gCntHooksInstalled);
+        RELog(@"RedditEnhancer v7 已加载（hook %ld 个）", (long)gCntHooksInstalled);
     }
 }
