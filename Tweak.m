@@ -2,9 +2,16 @@
 //  RedditEnhancer — TrollStore tweak for Reddit 2026.46.0
 //  Bundle ID: com.reddit.Reddit   Executable: RedditApp
 //
-//  v3 —— 抽屉推广位改走 UI 层拦截
-//  （v2 用 UserDefaults 折叠 key 无效的原因：抽屉内容被
-//   CommunityDrawerCacheServiceImpl 缓存成 ViewModel，改偏好不会重算）
+//  v4 —— 修复 v3 崩溃 + 入口收敛到设置页导航栏
+//
+//  v3 崩溃根因（RedditApp-2026-11-17-210334.ips）：
+//    _UIDiffableDataSourceViewUpdater → -[UITableView _endCellAnimationsWithContext:]
+//    → NSInternalInconsistencyException（Invalid update）
+//    抽屉表格用的是 diffable data source，行数由快照决定；
+//    v3 在 numberOfRowsInSection 里返回 0，等于让表格行数和快照脱钩，
+//    下一次批次更新必然判定「行数不一致」→ abort。
+//  v4 结论：绝对不能动 numberOfRowsInSection / numberOfSections / reloadData，
+//    改用「行高 + header 高度归零 + cell 隐藏」的纯视觉折叠，UIKit 不会校验高度。
 //
 //  静态分析事实（Reddit 2026.46.0 真实二进制）：
 //   * 抽屉 = CommunityDrawer_Rendering_Internal.CommunityDrawerViewController
@@ -21,13 +28,11 @@
 //     会员状态完全由服务端下发 → 客户端无法真正解锁。
 //
 //  本版策略：
-//   1) 抽屉：接管 UITableView 的 datasource/delegate，识别到推广分区后把
-//      行数设为 0、header 高度设为 0 —— 行被真正移除，不留空白。
+//   1) 抽屉：只改行高 / header 高度 + 隐藏 cell，绝不改行数（崩溃点）。
 //      识别信号：类名 + accessibilityIdentifier + 文案（三重冗余）。
-//   2) 设置入口：导航栏按钮 + 页面内兜底按钮（设置页是 SwiftUI 时没有
-//      UINavigationController，v2 的入口会直接消失）。
-//   3) 诊断页：显示所有 hook 命中计数与实时日志，便于逐步定位。
-//   4) Premium：只做「隐藏所有 Premium 推广入口」，不再假装解锁。
+//   2) 设置入口：只保留设置页导航栏上的「增强设置」，去掉角落小胶囊按钮。
+//   3) 新增：拦截广告 / 统计追踪请求；拦截 App Store 评分弹窗。
+//   4) 诊断页：显示所有 hook 命中计数与实时日志，便于逐步定位。
 //
 //  Build: Theos library.mk -> plain dylib, no Substrate dependency.
 //
@@ -50,6 +55,8 @@ static NSString *const kRECollapseAutoMod     = @"RE.collapse.automod";
 static NSString *const kREHidePremium         = @"RE.hide.premium";
 static NSString *const kREHideDrawerGames     = @"RE.hide.drawer.games";
 static NSString *const kREHideDrawerResources = @"RE.hide.drawer.resources";
+static NSString *const kREBlockTrackers       = @"RE.block.trackers";
+static NSString *const kREBlockReviewPrompt   = @"RE.block.reviewprompt";
 
 // Reddit 自己的抽屉折叠 key（写入作为次要手段）
 static NSString *const kRECollapsedGamesKey     = @"isGamesOnRedditCollapsed";
@@ -99,6 +106,7 @@ static NSObject *gRELogLock = nil;
 static NSDateFormatter *gREDateFmt = nil;
 static NSInteger gCntURLSession = 0, gCntJSON = 0, gCntNodes = 0;
 static NSInteger gCntAdStripped = 0, gCntDrawerTables = 0, gCntSectionsHidden = 0;
+static NSInteger gCntTrackersBlocked = 0, gCntReviewBlocked = 0;
 static NSInteger gCntHooksInstalled = 0;
 
 static void RELog(NSString *fmt, ...) {
@@ -122,6 +130,26 @@ static void RELog(NSString *fmt, ...) {
         [gRELog addObject:line];
         while (gRELog.count > 240) [gRELog removeObjectAtIndex:0];
     }
+}
+
+// 同一 key 只记一次（诊断用：把抽屉里真实出现的类名/标题都留档）
+static void RELogOnce(NSString *key, NSString *fmt, ...) {
+    static NSMutableSet *seen = nil;
+    static NSObject *lock = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        seen = [NSMutableSet set];
+        lock = [[NSObject alloc] init];
+    });
+    @synchronized (lock) {
+        if (key.length == 0 || seen.count > 200 || [seen containsObject:key]) return;
+        [seen addObject:key];
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    RELog(@"%@", msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +324,7 @@ static void RESwizzleInstance(id obj, SEL sel, IMP hook) {
 // 抽屉表格：分区过滤
 // ---------------------------------------------------------------------------
 static char kREHiddenSectionsKey;
-static char kREReloadPendingKey;
+static char kRENudgePendingKey;
 static char kREFiltersInstalledKey;
 
 // dataSource 类名 -> 已确认的推广分区（跨抽屉实例复用，避免每次打开闪一下）
@@ -342,23 +370,51 @@ static NSMutableIndexSet *RETableHiddenSet(UITableView *tv, BOOL create) {
     return set;
 }
 
-static void REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *reason) {
+// 让表格重新询问行高。
+// 注意：这里绝对不能 reloadData —— 抽屉是 diffable data source，
+// reloadData 会让 UIKit 的内部快照和真实行数脱钩，下一次 applySnapshot 就崩。
+// beginUpdates/endUpdates 是零变更批次，只触发高度重算，不会改行数。
+static void RELayoutNudge(UITableView *tv) {
     if (!tv) return;
-    NSMutableIndexSet *set = RETableHiddenSet(tv, YES);
-    if ([set containsIndex:section]) return;
+    if (objc_getAssociatedObject(tv, &kRENudgePendingKey)) return;
+    objc_setAssociatedObject(tv, &kRENudgePendingKey, @YES,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // 安全阀：分区行数过多说明它是「整个抽屉」而不是独立的推广分区，
-    // 这时只做视觉隐藏，绝不整段清空（否则会把侧边栏清空）
+    __weak UITableView *weakTV = tv;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UITableView *strongTV = weakTV;
+        if (!strongTV) return;
+        objc_setAssociatedObject(strongTV, &kRENudgePendingKey, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        @try {
+            [strongTV beginUpdates];
+            [strongTV endUpdates];
+        } @catch (NSException *e) {
+            RELog(@"重算行高被拒（忽略）：%@", e.reason);
+        }
+    });
+}
+
+static void REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *reason) {
+    if (!tv || section < 0) return;
+    NSMutableIndexSet *set = RETableHiddenSet(tv, YES);
+    if (!set || [set containsIndex:section]) return;
+
+    // 安全阀：分区行数过多说明它是「整块抽屉列表」而不是独立的推广分区，
+    // 这时放弃折叠，避免因为一个 cell 文案匹配把整个侧边栏藏掉。
     id ds = tv.dataSource;
     if (ds) {
         SEL sel = @selector(tableView:numberOfRowsInSection:);
-        NSInteger (*fn)(id, SEL, UITableView *, NSInteger) = (void *)REOriIMP(ds, sel);
-        if (fn) {
-            NSInteger rows = fn(ds, sel, tv, section);
-            if (rows > 14) {
-                RELog(@"分区 #%ld 有 %ld 行，判定为非独立推广分区，跳过整段移除（%@）",
-                      (long)section, (long)rows, reason);
-                return;
+        if ([ds respondsToSelector:sel]) {
+            NSInteger (*fn)(id, SEL, UITableView *, NSInteger) =
+                (void *)[ds methodForSelector:sel];
+            if (fn) {
+                NSInteger rows = fn(ds, sel, tv, section);
+                if (rows > 10) {
+                    RELog(@"分区 #%ld 有 %ld 行，判定为整块列表，跳过折叠（%@）",
+                          (long)section, (long)rows, reason);
+                    return;
+                }
             }
         }
     }
@@ -376,38 +432,33 @@ static void REMarkSectionHidden(UITableView *tv, NSInteger section, NSString *re
         [cached addIndex:section];
     }
 
-    RELog(@"移除抽屉分区 #%ld（%@）ds=%@", (long)section, reason, clsName);
+    RELog(@"折叠抽屉分区 #%ld（%@）ds=%@", (long)section, reason, clsName);
 
-    if (objc_getAssociatedObject(tv, &kREReloadPendingKey)) return;
-    objc_setAssociatedObject(tv, &kREReloadPendingKey, @YES,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // 已经显示出来的 cell 先直接藏掉，避免高度重算前闪一下
+    for (UITableViewCell *cell in tv.visibleCells) {
+        NSIndexPath *ip = [tv indexPathForCell:cell];
+        if (ip && ip.section == section) {
+            cell.hidden = YES;
+            cell.alpha = 0.0;
+        }
+    }
 
-    __weak UITableView *weakTV = tv;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UITableView *strongTV = weakTV;
-        if (!strongTV) return;
-        objc_setAssociatedObject(strongTV, &kREReloadPendingKey, nil,
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [strongTV reloadData];
-    });
+    RELayoutNudge(tv);
 }
 
 // --- 具体 hook ---
-
-static NSInteger REHookNumberOfRows(id self, SEL _cmd, UITableView *tv, NSInteger section) {
-    NSMutableIndexSet *set = RETableHiddenSet(tv, NO);
-    if (set && [set containsIndex:section]) return 0;
-
-    NSInteger (*orig)(id, SEL, UITableView *, NSInteger) = (void *)REOriIMP(self, _cmd);
-    return orig ? orig(self, _cmd, tv, section) : 0;
-}
+// 注意：没有 numberOfRowsInSection / numberOfSections 的 hook。
+// 抽屉是 diffable data source，行数一旦被改写，UIKit 会抛
+// NSInternalInconsistencyException（Invalid update）直接 abort —— 这是 v3 崩溃点。
 
 static CGFloat REHookHeightForRow(id self, SEL _cmd, UITableView *tv, NSIndexPath *indexPath) {
     NSMutableIndexSet *set = RETableHiddenSet(tv, NO);
     if (set && [set containsIndex:indexPath.section]) return 0.0;
 
     CGFloat (*orig)(id, SEL, UITableView *, NSIndexPath *) = (void *)REOriIMP(self, _cmd);
-    return orig ? orig(self, _cmd, tv, indexPath) : UITableViewAutomaticDimension;
+    if (orig) return orig(self, _cmd, tv, indexPath);
+    // 原来没有实现这个方法（cell 自撑高）：保持表格自身配置，不要硬塞自动高度
+    return tv.rowHeight > 0 ? tv.rowHeight : UITableViewAutomaticDimension;
 }
 
 static CGFloat REHookHeightForHeader(id self, SEL _cmd, UITableView *tv, NSInteger section) {
@@ -415,12 +466,16 @@ static CGFloat REHookHeightForHeader(id self, SEL _cmd, UITableView *tv, NSInteg
     if (set && [set containsIndex:section]) return 0.0;
 
     CGFloat (*orig)(id, SEL, UITableView *, NSInteger) = (void *)REOriIMP(self, _cmd);
-    return orig ? orig(self, _cmd, tv, section) : 0.0;
+    if (orig) return orig(self, _cmd, tv, section);
+    return tv.sectionHeaderHeight;
 }
 
 static NSString *REHookTitleForHeader(id self, SEL _cmd, UITableView *tv, NSInteger section) {
     NSString *(*orig)(id, SEL, UITableView *, NSInteger) = (void *)REOriIMP(self, _cmd);
     NSString *title = orig ? orig(self, _cmd, tv, section) : nil;
+    if ([title isKindOfClass:[NSString class]] && title.length > 0) {
+        RELogOnce([@"hdr|" stringByAppendingString:title], @"抽屉分区标题：%@", title);
+    }
     if (RETableIsDrawer(tv) && RETitleIsPromo(title)) {
         REMarkSectionHidden(tv, section, @"分区标题");
         return nil;
@@ -428,13 +483,21 @@ static NSString *REHookTitleForHeader(id self, SEL _cmd, UITableView *tv, NSInte
     return title;
 }
 
+// 只有分区真的被折叠了才隐藏视图，避免安全阀拦下之后留下空白洞
+static BOOL RESectionIsHidden(UITableView *tv, NSInteger section) {
+    NSMutableIndexSet *set = RETableHiddenSet(tv, NO);
+    return set != nil && [set containsIndex:section];
+}
+
 static UIView *REHookViewForHeader(id self, SEL _cmd, UITableView *tv, NSInteger section) {
     UIView *(*orig)(id, SEL, UITableView *, NSInteger) = (void *)REOriIMP(self, _cmd);
     UIView *view = orig ? orig(self, _cmd, tv, section) : nil;
     if (RETableIsDrawer(tv) && view && REViewIsPromo(view)) {
         REMarkSectionHidden(tv, section, @"分区头视图");
-        view.hidden = YES;
-        return nil;
+        if (RESectionIsHidden(tv, section)) {
+            view.hidden = YES;
+            return nil;
+        }
     }
     return view;
 }
@@ -442,9 +505,20 @@ static UIView *REHookViewForHeader(id self, SEL _cmd, UITableView *tv, NSInteger
 static UITableViewCell *REHookCellForRow(id self, SEL _cmd, UITableView *tv, NSIndexPath *indexPath) {
     UITableViewCell *(*orig)(id, SEL, UITableView *, NSIndexPath *) = (void *)REOriIMP(self, _cmd);
     UITableViewCell *cell = orig ? orig(self, _cmd, tv, indexPath) : nil;
+
+    // 留档：抽屉里真实出现的 cell 类名 + 无障碍标识，便于下次精确匹配
+    if (cell && RETableIsDrawer(tv)) {
+        NSString *cls = NSStringFromClass([cell class]) ?: @"?";
+        NSString *ident = cell.accessibilityIdentifier ?: @"";
+        NSString *key = [NSString stringWithFormat:@"cell|%@|%@|%ld",
+                         cls, ident, (long)indexPath.section];
+        RELogOnce(key, @"抽屉 cell：%@ ident=%@ section=%ld",
+                  cls, ident.length ? ident : @"(无)", (long)indexPath.section);
+    }
+
     if (RETableIsDrawer(tv) && cell && REViewIsPromo(cell)) {
-        cell.hidden = YES;
         REMarkSectionHidden(tv, indexPath.section, @"推广 cell");
+        if (RESectionIsHidden(tv, indexPath.section)) cell.hidden = YES;
     }
     return cell;
 }
@@ -456,8 +530,8 @@ static void REHookWillDisplayCell(id self, SEL _cmd, UITableView *tv,
     if (orig) orig(self, _cmd, tv, cell, indexPath);
 
     if (RETableIsDrawer(tv) && cell && REViewIsPromo(cell)) {
-        cell.hidden = YES;
         REMarkSectionHidden(tv, indexPath.section, @"cell 显示");
+        if (RESectionIsHidden(tv, indexPath.section)) cell.hidden = YES;
     }
 }
 
@@ -467,8 +541,8 @@ static void REHookWillDisplayHeader(id self, SEL _cmd, UITableView *tv,
     if (orig) orig(self, _cmd, tv, view, section);
 
     if (RETableIsDrawer(tv) && view && REViewIsPromo(view)) {
-        view.hidden = YES;
         REMarkSectionHidden(tv, section, @"header 显示");
+        if (RESectionIsHidden(tv, section)) view.hidden = YES;
     }
 }
 
@@ -508,8 +582,6 @@ static void REInstallFiltersOnTable(UITableView *tableView) {
     if (delegate && delegate != dataSource) [targets addObject:delegate];
 
     for (id obj in targets) {
-        RESwizzleInstance(obj, @selector(tableView:numberOfRowsInSection:),
-                          (IMP)REHookNumberOfRows);
         RESwizzleInstance(obj, @selector(tableView:heightForRowAtIndexPath:),
                           (IMP)REHookHeightForRow);
         RESwizzleInstance(obj, @selector(tableView:heightForHeaderInSection:),
@@ -592,7 +664,11 @@ static void REResetDrawerCache(void) {
         for (UITableView *tv in tables) {
             objc_setAssociatedObject(tv, &kREHiddenSectionsKey, nil,
                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            [tv reloadData];
+            for (UITableViewCell *cell in tv.visibleCells) {
+                cell.hidden = NO;
+                cell.alpha = 1.0;
+            }
+            RELayoutNudge(tv);
         }
     });
 }
@@ -755,6 +831,47 @@ static void REWalkJSON(id obj, NSUInteger depth) {
 static IMP gOrigDataTask = NULL;
 static _Thread_local BOOL gREInFilter = NO;
 
+// 广告 / 统计追踪域名（从 2026.46.0 二进制里挖出来的真实域名 + 常见第三方 SDK）
+static NSArray<NSString *> *RETrackerHosts(void) {
+    static NSArray *hosts = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        hosts = @[
+            @"ads.reddit.com", @"ads-api.reddit.com", @"alb.reddit.com",
+            @"pixel-config.reddit.com",
+            @"app.appsflyer.com", @"appsflyersdk.com",
+            @"app-measurement.com", @"google-analytics.com",
+            @"firebaselogging", @"crashlytics.com",
+            @"braze.com", @"appboy.com",
+            @"sentry.io", @"amplitude.com", @"mixpanel.com",
+            @"doubleclick.net", @"googlesyndication.com"
+        ];
+    });
+    return hosts;
+}
+
+static BOOL REHostIsTracker(NSString *host) {
+    if (host.length == 0) return NO;
+    for (NSString *needle in RETrackerHosts()) {
+        if ([host hasSuffix:needle] || [host containsString:needle]) return YES;
+    }
+    return NO;
+}
+
+// 直接回一个 204 空响应，请求不出网
+static void REBlockRequest(NSURLRequest *request,
+                           void (^completionHandler)(NSData *, NSURLResponse *, NSError *)) {
+    gCntTrackersBlocked++;
+    NSHTTPURLResponse *response =
+        [[NSHTTPURLResponse alloc] initWithURL:request.URL
+                                    statusCode:204
+                                   HTTPVersion:@"HTTP/1.1"
+                                  headerFields:@{}];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        completionHandler([NSData data], response, nil);
+    });
+}
+
 typedef NSURLSessionDataTask *(*REDataTaskIMP)(id, SEL, NSURLRequest *,
                                                void (^)(NSData *, NSURLResponse *, NSError *));
 
@@ -763,9 +880,17 @@ static NSURLSessionDataTask *REHookedDataTask(id self, SEL _cmd, NSURLRequest *r
     NSString *host = request.URL.host.lowercaseString ?: @"";
     BOOL isReddit = [host containsString:@"reddit.com"] ||
                     [host containsString:@"redd.it"];
+
+    // 追踪/广告域名先拦，不看是不是 reddit 域（appsflyer 之类是第三方域）
+    if (completionHandler && REBool(kREBlockTrackers, YES) && REHostIsTracker(host)) {
+        REBlockRequest(request, completionHandler);
+        return nil;   // nil 的 task 上 resume/cancel 都是空操作
+    }
+
     if (!isReddit || !completionHandler) {
         return ((REDataTaskIMP)gOrigDataTask)(self, _cmd, request, completionHandler);
     }
+
     gCntURLSession++;
 
     void (^wrapped)(NSData *, NSURLResponse *, NSError *) =
@@ -855,48 +980,156 @@ static void REInstallJSONHook(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Hook: SKStoreReviewController —— 屏蔽「给 Reddit 评分」弹窗
+// ---------------------------------------------------------------------------
+static IMP gOrigRequestReview = NULL;
+static IMP gOrigRequestReviewInScene = NULL;
+
+static void REHookRequestReview(id self, SEL _cmd) {
+    if (!REBool(kREBlockReviewPrompt, YES)) {
+        if (gOrigRequestReview) ((void (*)(id, SEL))gOrigRequestReview)(self, _cmd);
+        return;
+    }
+    gCntReviewBlocked++;
+    RELog(@"拦截 App Store 评分弹窗");
+}
+
+static void REHookRequestReviewInScene(id self, SEL _cmd, id scene) {
+    if (!REBool(kREBlockReviewPrompt, YES)) {
+        if (gOrigRequestReviewInScene) {
+            ((void (*)(id, SEL, id))gOrigRequestReviewInScene)(self, _cmd, scene);
+        }
+        return;
+    }
+    gCntReviewBlocked++;
+    RELog(@"拦截 App Store 评分弹窗（scene）");
+}
+
+static void REInstallReviewHook(void) {
+    Class cls = objc_getClass("SKStoreReviewController");
+    if (!cls) {
+        RELog(@"没找到 SKStoreReviewController，跳过评分拦截");
+        return;
+    }
+    Method m = class_getClassMethod(cls, @selector(requestReview));
+    if (m) {
+        gOrigRequestReview = method_getImplementation(m);
+        method_setImplementation(m, (IMP)REHookRequestReview);
+        gCntHooksInstalled++;
+    }
+    Method m2 = class_getClassMethod(cls, @selector(requestReviewInScene:));
+    if (m2) {
+        gOrigRequestReviewInScene = method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)REHookRequestReviewInScene);
+        gCntHooksInstalled++;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 设置项
 // ---------------------------------------------------------------------------
-static NSArray<NSDictionary *> *RERows(void) {
+// 设置页数据模型：分区 -> 行；最后一个分区是「其他」，只有一行（诊断入口）
+static NSArray<NSDictionary *> *RESettingsModel(void) {
+    static NSArray *model = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        model = @[
+            @{ @"t": @"内容过滤",
+               @"f": @"开关即时生效，无需重启 App。",
+               @"rows": @[
+                    @{ @"k": kREFilterPromoted,    @"t": @"去除广告与推广",
+                       @"s": @"移除推广帖、广告和赞助内容", @"d": @YES },
+                    @{ @"k": kREFilterRecommended, @"t": @"隐藏推荐内容",
+                       @"s": @"去掉「相似帖子」等推荐注入", @"d": @NO },
+                    @{ @"k": kREFilterNSFW,        @"t": @"屏蔽 NSFW 内容",
+                       @"s": @"从信息流中隐藏 NSFW 内容", @"d": @NO },
+               ]},
+
+            @{ @"t": @"界面精简",
+               @"f": @"隐藏类开关只影响显示，不改变内容排序。",
+               @"rows": @[
+                    @{ @"k": kREHideAwards,      @"t": @"隐藏赞赏徽章",
+                       @"s": @"移除帖子和评论的赞赏徽章", @"d": @NO },
+                    @{ @"k": kREHideScores,      @"t": @"隐藏投票数",
+                       @"s": @"隐藏点赞／点踩数量", @"d": @NO },
+                    @{ @"k": kRECollapseAutoMod, @"t": @"折叠 AutoMod 评论",
+                       @"s": @"自动收起 AutoMod 机器人的回复", @"d": @NO },
+                    @{ @"k": kREHidePremium,     @"t": @"隐藏 Premium 推广",
+                       @"s": @"移除 Premium 横幅、升级提示与入口", @"d": @NO },
+               ]},
+
+            @{ @"t": @"侧边栏（左侧抽屉）",
+               @"f": @"打开左侧抽屉时生效；若没变化，去「其他 → 诊断信息」看命中数。",
+               @"rows": @[
+                    @{ @"k": kREHideDrawerGames,     @"t": @"隐藏「Reddit 上的游戏」",
+                       @"s": @"折叠抽屉里的 Devvit 游戏推荐分区", @"d": @YES },
+                    @{ @"k": kREHideDrawerResources, @"t": @"隐藏「资源」推广区",
+                       @"s": @"折叠 Reddit Pro／Premium／广告合作等入口", @"d": @YES },
+               ]},
+
+            @{ @"t": @"隐私与体验",
+               @"f": @"屏蔽后不影响正常刷帖，只是不再上报统计、不再弹评分。",
+               @"rows": @[
+                    @{ @"k": kREBlockTrackers,     @"t": @"屏蔽广告与统计追踪",
+                       @"s": @"拦截广告服务器与第三方统计域名", @"d": @YES },
+                    @{ @"k": kREBlockReviewPrompt, @"t": @"屏蔽 App Store 评分弹窗",
+                       @"s": @"不再弹出「给 Reddit 评分」", @"d": @YES },
+               ]},
+
+            @{ @"t": @"其他",
+               @"f": @"Reddit 增强 · 适用于 Reddit 2026.46.0（巨魔）\n"
+                     "会员权限由服务器校验，客户端无法真正解锁；本插件只做展示层优化。",
+               @"rows": @[] }
+        ];
+    });
+    return model;
+}
+
+static NSArray<NSDictionary *> *REAllRows(void) {
     static NSArray *rows = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        rows = @[
-            @{ @"k": kREFilterPromoted,      @"t": @"去除广告与推广",
-               @"s": @"移除推广帖、广告和赞助内容", @"d": @YES },
-            @{ @"k": kREFilterRecommended,   @"t": @"隐藏推荐内容",
-               @"s": @"去掉「相似帖子」等推荐注入", @"d": @NO },
-            @{ @"k": kREFilterNSFW,          @"t": @"屏蔽 NSFW 内容",
-               @"s": @"从信息流中隐藏 NSFW 内容", @"d": @NO },
-            @{ @"k": kREHideAwards,          @"t": @"隐藏赞赏徽章",
-               @"s": @"移除帖子和评论的赞赏徽章", @"d": @NO },
-            @{ @"k": kREHideScores,          @"t": @"隐藏投票数",
-               @"s": @"隐藏点赞／点踩数量", @"d": @NO },
-
-            @{ @"k": kREHideDrawerGames,     @"t": @"隐藏侧边栏游戏位",
-               @"s": @"移除左侧菜单「Reddit 上的游戏」整块", @"d": @YES },
-            @{ @"k": kREHideDrawerResources, @"t": @"隐藏侧边栏资源位",
-               @"s": @"移除「资源 / Reddit Pro / Premium」链接", @"d": @YES },
-            @{ @"k": kRECollapseAutoMod,     @"t": @"折叠 AutoMod 评论",
-               @"s": @"自动收起 AutoMod 机器人的回复", @"d": @NO },
-            @{ @"k": kREHidePremium,         @"t": @"隐藏 Premium 推广",
-               @"s": @"移除 Premium 横幅、升级提示与入口", @"d": @NO }
-        ];
+        NSMutableArray *all = [NSMutableArray array];
+        for (NSDictionary *section in RESettingsModel()) {
+            [all addObjectsFromArray:section[@"rows"]];
+        }
+        rows = [all copy];
     });
     return rows;
 }
 
-static NSInteger RERowCount(void) { return (NSInteger)RERows().count; }
-static NSInteger RESectionCount(void) { return 3; }
+static NSInteger RERowCount(void) { return (NSInteger)REAllRows().count; }
+static NSInteger RESectionCount(void) { return (NSInteger)RESettingsModel().count; }
+
+static NSDictionary *RESectionAt(NSInteger section) {
+    NSArray *model = RESettingsModel();
+    if (section < 0 || section >= (NSInteger)model.count) return nil;
+    return model[(NSUInteger)section];
+}
+
+static BOOL RESectionIsDiagnostics(NSInteger section) {
+    NSDictionary *sec = RESectionAt(section);
+    return sec != nil && [(NSArray *)sec[@"rows"] count] == 0;
+}
 
 static NSInteger RERowsInSection(NSInteger section) {
-    if (section == 0) return 5;
-    if (section == 1) return RERowCount() - 5;
-    return 1;   // 诊断
+    NSDictionary *sec = RESectionAt(section);
+    if (!sec) return 0;
+    NSArray *rows = sec[@"rows"];
+    return rows.count > 0 ? (NSInteger)rows.count : 1;   // 诊断入口占一行
+}
+
+static NSInteger RESectionBaseIndex(NSInteger section) {
+    NSInteger base = 0;
+    for (NSInteger i = 0; i < section; i++) {
+        NSDictionary *sec = RESectionAt(i);
+        base += (NSInteger)[(NSArray *)sec[@"rows"] count];
+    }
+    return base;
 }
 
 static NSInteger RERowIndexForIndexPath(NSIndexPath *indexPath) {
-    return indexPath.section == 0 ? indexPath.row : 5 + indexPath.row;
+    return RESectionBaseIndex(indexPath.section) + indexPath.row;
 }
 
 // ---------------------------------------------------------------------------
@@ -907,14 +1140,16 @@ static NSString *REDiagnosticsText(void) {
     [text appendString:@"== Hook 状态 ==\n"];
     [text appendFormat:@"已安装 hook: %ld\n", (long)gCntHooksInstalled];
     [text appendFormat:@"接管抽屉表格: %ld\n", (long)gCntDrawerTables];
-    [text appendFormat:@"移除抽屉分区: %ld\n", (long)gCntSectionsHidden];
+    [text appendFormat:@"折叠抽屉分区: %ld\n", (long)gCntSectionsHidden];
+    [text appendFormat:@"拦截评分弹窗: %ld\n", (long)gCntReviewBlocked];
     [text appendString:@"\n== 网络 ==\n"];
     [text appendFormat:@"NSURLSession 命中: %ld\n", (long)gCntURLSession];
+    [text appendFormat:@"拦截追踪请求: %ld\n", (long)gCntTrackersBlocked];
     [text appendFormat:@"JSON 解析命中: %ld\n", (long)gCntJSON];
     [text appendFormat:@"JSON 节点处理: %ld\n", (long)gCntNodes];
     [text appendFormat:@"剥离广告/推荐: %ld\n", (long)gCntAdStripped];
     [text appendString:@"\n== 开关 ==\n"];
-    for (NSDictionary *row in RERows()) {
+    for (NSDictionary *row in REAllRows()) {
         NSString *key = row[@"k"];
         BOOL on = REBool(key, [row[@"d"] boolValue]);
         [text appendFormat:@"%@ %@\n", on ? @"[开]" : @"[关]", row[@"t"]];
@@ -1015,20 +1250,17 @@ static NSString *REDiagnosticsText(void) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    if (section == 0) return @"内容过滤";
-    if (section == 1) return @"界面精简";
-    return @"其他";
+    NSString *title = RESectionAt(section)[@"t"];
+    return title ?: @"";
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    if (section == 0) return @"开关即时生效，无需重启 App。";
-    if (section == 1) return @"侧边栏开关会在下次打开左侧菜单时立即生效。";
-    return @"Reddit 增强 · 适用于 Reddit 2026.46.0（巨魔）\n"
-            "Premium 权限由服务器校验，客户端无法真正解锁，本插件只负责隐藏相关推广入口。";
+    NSString *footer = RESectionAt(section)[@"f"];
+    return footer ?: @"";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (indexPath.section == 2) {
+    if (RESectionIsDiagnostics(indexPath.section)) {
         UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"REDiagCell"];
         if (!cell) {
             cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault
@@ -1047,7 +1279,9 @@ static NSString *REDiagnosticsText(void) {
     }
 
     NSInteger index = RERowIndexForIndexPath(indexPath);
-    NSDictionary *row = RERows()[(NSUInteger)index];
+    NSArray *all = REAllRows();
+    if (index < 0 || index >= (NSInteger)all.count) return cell;
+    NSDictionary *row = all[(NSUInteger)index];
 
     cell.textLabel.text = row[@"t"];
     cell.detailTextLabel.text = row[@"s"];
@@ -1067,7 +1301,7 @@ static NSString *REDiagnosticsText(void) {
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    if (indexPath.section == 2) {
+    if (RESectionIsDiagnostics(indexPath.section)) {
         REDiagnosticsViewController *diag = [[REDiagnosticsViewController alloc] init];
         [self.navigationController pushViewController:diag animated:YES];
     }
@@ -1075,8 +1309,9 @@ static NSString *REDiagnosticsText(void) {
 
 - (void)re_toggle:(UISwitch *)sender {
     NSInteger index = sender.tag;
-    if (index < 0 || index >= RERowCount()) return;
-    NSDictionary *row = RERows()[(NSUInteger)index];
+    NSArray *all = REAllRows();
+    if (index < 0 || index >= (NSInteger)all.count) return;
+    NSDictionary *row = all[(NSUInteger)index];
     NSString *key = row[@"k"];
 
     REBoolSet(key, sender.on);
@@ -1151,7 +1386,7 @@ static NSString *REDiagnosticsText(void) {
 // ---------------------------------------------------------------------------
 // Hook: UIViewController -viewDidAppear:  —— 抽屉接管 + 设置入口注入
 // ---------------------------------------------------------------------------
-static char kREEntryAssociatedKey;
+static char kREEntryRetryKey;
 
 static BOOL REIsExcludedSettingsLike(NSString *hay) {
     NSArray *blocked = @[@"modtools", @"notification", @"translation",
@@ -1163,46 +1398,90 @@ static BOOL REIsExcludedSettingsLike(NSString *hay) {
     return NO;
 }
 
-static void REInjectEntryIntoPage(UIViewController *vc) {
-    if (objc_getAssociatedObject(vc, &kREEntryAssociatedKey)) return;
-    objc_setAssociatedObject(vc, &kREEntryAssociatedKey, @YES,
+static UINavigationController *REFindNavigationController(UIViewController *vc) {
+    for (UIViewController *cur = vc; cur; cur = cur.parentViewController) {
+        if ([cur isKindOfClass:[UINavigationController class]]) {
+            return (UINavigationController *)cur;
+        }
+        if (cur.navigationController) return cur.navigationController;
+    }
+    return nil;
+}
+
+// SwiftUI 的 NavigationStack 用的是 SwiftUI 自己的 UINavigationBar 子类，
+// 不在 UINavigationController 里，所以只能从视图树里捞。
+static UINavigationBar *REFindNavigationBar(UIView *view, NSUInteger depth) {
+    if (!view || depth > 12) return nil;
+    if ([view isKindOfClass:[UINavigationBar class]]) return (UINavigationBar *)view;
+    for (UIView *sub in view.subviews) {
+        UINavigationBar *bar = REFindNavigationBar(sub, depth + 1);
+        if (bar) return bar;
+    }
+    return nil;
+}
+
+static BOOL REBarItemExists(NSArray<UIBarButtonItem *> *items) {
+    for (UIBarButtonItem *item in items) {
+        if ([item.accessibilityIdentifier isEqualToString:@"REEntryBarItem"]) return YES;
+        if ([item.title containsString:@"增强"]) return YES;
+    }
+    return NO;
+}
+
+static UIBarButtonItem *REMakeEntryBarItem(void) {
+    UIBarButtonItem *item =
+        [[UIBarButtonItem alloc] initWithTitle:@"增强设置"
+                                         style:UIBarButtonItemStylePlain
+                                        target:[REUIHelper shared]
+                                        action:@selector(openSettings)];
+    item.accessibilityIdentifier = @"REEntryBarItem";
+    return item;
+}
+
+// 入口只放导航栏：普通 UIKit 导航栈 → 退到 SwiftUI 自绘导航栏。
+// 不再放任何悬浮／角落小按钮。
+static void REInjectEntryIntoPage(UIViewController *vc);
+
+// SwiftUI 的导航栏是渲染之后才有的，viewDidAppear 时可能还没生成 → 稍后重试
+static void REScheduleEntryRetry(UIViewController *vc) {
+    NSNumber *tries = objc_getAssociatedObject(vc, &kREEntryRetryKey);
+    if (tries.integerValue >= 3) return;
+    objc_setAssociatedObject(vc, &kREEntryRetryKey, @(tries.integerValue + 1),
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    if (vc.navigationController) {
-        UIBarButtonItem *button =
-            [[UIBarButtonItem alloc] initWithTitle:@"增强设置"
-                                             style:UIBarButtonItemStylePlain
-                                            target:[REUIHelper shared]
-                                            action:@selector(openSettings)];
-        NSArray *right = vc.navigationItem.rightBarButtonItems;
-        vc.navigationItem.rightBarButtonItems =
-            right.count ? [right arrayByAddingObject:button] : @[ button ];
-        RELog(@"设置页注入导航栏入口：%@", NSStringFromClass([vc class]));
+    __weak UIViewController *weakVC = vc;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UIViewController *strongVC = weakVC;
+        if (strongVC && strongVC.isViewLoaded) REInjectEntryIntoPage(strongVC);
+    });
+}
+
+static void REInjectEntryIntoPage(UIViewController *vc) {
+    UINavigationController *nav = REFindNavigationController(vc);
+    if (nav) {
+        UIViewController *target = nav.topViewController ?: vc;
+        if (!target) return;
+        if (REBarItemExists(target.navigationItem.rightBarButtonItems)) return;
+        NSArray *right = target.navigationItem.rightBarButtonItems ?: @[];
+        target.navigationItem.rightBarButtonItems =
+            [right arrayByAddingObject:REMakeEntryBarItem()];
+        RELog(@"设置入口 → 导航栏（%@）", NSStringFromClass([target class]));
         return;
     }
 
-    // SwiftUI 设置页往往没有 UINavigationController → 页面内兜底按钮
-    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-    button.translatesAutoresizingMaskIntoConstraints = NO;
-    [button setTitle:@"增强" forState:UIControlStateNormal];
-    button.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-    button.backgroundColor = [UIColor colorWithWhite:0.5 alpha:0.14];
-    button.layer.cornerRadius = 13;
-    button.accessibilityIdentifier = @"REEntryButton";
-    [button addTarget:[REUIHelper shared]
-               action:@selector(openSettings)
-     forControlEvents:UIControlEventTouchUpInside];
-    [vc.view addSubview:button];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [button.trailingAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.trailingAnchor
-                                              constant:-12],
-        [button.topAnchor constraintEqualToAnchor:vc.view.safeAreaLayoutGuide.topAnchor
-                                        constant:8],
-        [button.widthAnchor constraintEqualToConstant:62],
-        [button.heightAnchor constraintEqualToConstant:26]
-    ]];
-    RELog(@"设置页注入页面内入口（无导航栏）：%@", NSStringFromClass([vc class]));
+    if (!vc.isViewLoaded) return;
+    UINavigationBar *bar = REFindNavigationBar(vc.view, 0);
+    UINavigationItem *item = bar.topItem;
+    if (item) {
+        if (REBarItemExists(item.rightBarButtonItems)) return;
+        NSArray *right = item.rightBarButtonItems ?: @[];
+        item.rightBarButtonItems = [right arrayByAddingObject:REMakeEntryBarItem()];
+        RELog(@"设置入口 → SwiftUI 导航栏（%@）", NSStringFromClass([vc class]));
+        return;
+    }
+    RELog(@"设置页暂时没有导航栏，稍后重试：%@", NSStringFromClass([vc class]));
+    REScheduleEntryRetry(vc);
 }
 
 static void REHookedViewDidAppear(id self, SEL _cmd, BOOL animated) {
@@ -1244,7 +1523,7 @@ __attribute__((constructor)) static void REInitialize(void) {
         REInitSwizzleTables();
 
         NSMutableDictionary *defaults = [NSMutableDictionary dictionary];
-        for (NSDictionary *row in RERows()) {
+        for (NSDictionary *row in REAllRows()) {
             defaults[row[@"k"]] = row[@"d"];
         }
         // 只注册到 standard：REBool 先读 App Group 的显式值，再回落到
@@ -1254,6 +1533,7 @@ __attribute__((constructor)) static void REInitialize(void) {
 
         REInstallNetworkHook();
         REInstallJSONHook();
+        REInstallReviewHook();
 
         RESwizzleClass([UIViewController class],
                        @selector(viewDidAppear:),
@@ -1265,6 +1545,6 @@ __attribute__((constructor)) static void REInitialize(void) {
         REWriteDrawerCollapseKeys();
         REDiscoverDrawerTables();
 
-        RELog(@"RedditEnhancer v3 已加载（hook %ld 个）", (long)gCntHooksInstalled);
+        RELog(@"RedditEnhancer v4 已加载（hook %ld 个）", (long)gCntHooksInstalled);
     }
 }
