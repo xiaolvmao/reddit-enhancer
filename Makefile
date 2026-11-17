@@ -21,7 +21,7 @@ LIBRARY_NAME = RedditEnhancer
 
 RedditEnhancer_FILES      = Tweak.m
 RedditEnhancer_FRAMEWORKS = Foundation UIKit
-RedditEnhancer_CFLAGS     = -fobjc-arc -Wno-objc-msgsend-selector-starts-with-_
+RedditEnhancer_CFLAGS     = -fobjc-arc -Wno-unknown-warning-option
 
 # Where the dylib will live inside the injected app. Azule/optool
 # add the matching LC_LOAD_DYLIB entry to the RedditApp binary.
